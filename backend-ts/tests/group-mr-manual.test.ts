@@ -1,3 +1,4 @@
+const agentResult=(text:string,sha:string)=>text+'<ops-studio-review-result>'+JSON.stringify({sha,assessments:[],findings:[]})+'</ops-studio-review-result>';
 import {after,test} from 'node:test';
 import {strict as assert} from 'node:assert';
 import Fastify from 'fastify';
@@ -19,7 +20,7 @@ function harness(){
   if(args[0]==='pi'){
    state.piCalls++;await state.piBlock;
    if(state.piFailure)return {exitCode:1,output:'test failure'};
-   onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'检视已完成'}}),false);
+   onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:agentResult('检视已完成',sha)}}),false);
    onLine?.(JSON.stringify({type:'agent_settled'}),false);return {exitCode:0,output:''};
   }
   if(args[1]==='user')value={username:'operator'};
@@ -67,8 +68,8 @@ for(const scenario of ['issues','pending','missing','failed','pi-failed'] as con
  try{
   await h.service.submitManual({url});await settle(h.service);const row=h.service.list()[0]!;
   assert.equal(h.sent.length,1);assert.equal(h.sent[0]?.receiver,'owner123');assert.equal(row.notification?.status,'sent');assert.equal(row.reply,undefined);assert.equal(h.calls.some(c=>c[0]==='welink-cli'),false);
-  assert.equal(row.phase,scenario==='issues'||scenario==='pi-failed'?'ISSUES':scenario==='failed'?'FAILED':'PIPELINE');
-  if(scenario==='pi-failed')assert.equal(row.writePending,'Pi 提交检视意见');else assert.match(h.sent[0]!.content,/检视|意见/);
+  assert.equal(row.phase,scenario==='pi-failed'?'FAILED':scenario==='issues'?'ISSUES':scenario==='failed'?'FAILED':'PIPELINE');
+  if(scenario==='pi-failed')assert.equal(row.writePending,'');else assert.match(h.sent[0]!.content,/检视|意见/);
  }finally{await h.close();}
 });
 
@@ -104,7 +105,7 @@ test('manual task pins its recipient and never falls back to group replies when 
 test('manual submission cannot bypass uncertain writes in hidden or superseded attempts',async()=>{
  const h=harness();h.state.piFailure=true;try{
   const {entryId}=await h.service.submitManual({url});await settle(h.service);const row=h.service.list()[0]!;
-  h.store.putRecord('group-mr-entry',entryId,{...row,supersededBy:'another-entry'});h.store.putRecord('group-mr-hidden',entryId,{id:entryId});
+  h.store.putRecord('group-mr-entry',entryId,{...row,writePending:'审核',supersededBy:'another-entry'});h.store.putRecord('group-mr-hidden',entryId,{id:entryId});
   await assert.rejects(h.service.submitManual({url}),/结果待核对/);assert.equal(h.state.piCalls,1);assert.equal(h.service.list().length,1);
  }finally{await h.close();}
 });
@@ -126,11 +127,11 @@ test('a manual request reuses completed same-SHA review but gets its own notific
  }finally{await h.close();}
 });
 
-test('hidden current pending review is restored to the list so the user can resolve it without replay',async()=>{
+test('hidden failed analysis can be explicitly retried without manual acknowledgement',async()=>{
  const h=harness();h.state.piFailure=true;try{
-  const {entryId}=await h.service.submitManual({url});await settle(h.service);h.service.removeHistory(entryId);assert.equal(h.service.summary().pending.length,0);
-  await assert.rejects(h.service.submitManual({url}),/已恢复待核对记录/);
-  assert.equal(h.service.summary().pending[0]?.id,entryId);assert.equal(h.service.summary().pending[0]?.writePending,'Pi 提交检视意见');assert.equal(h.state.piCalls,1);
+  const {entryId}=await h.service.submitManual({url});await settle(h.service);h.service.removeHistory(entryId);
+  h.state.piFailure=false;const next=await h.service.submitManual({url});await settle(h.service);
+  assert.notEqual(next.entryId,entryId);assert.equal(h.state.piCalls,2);assert.equal(h.service.summary().pending[0]?.phase,'HUMAN');
  }finally{await h.close();}
 });
 
@@ -146,13 +147,13 @@ test('confirmed recovery in a same-execution successor does not leave manual sub
  }finally{await h.close();}
 });
 
-test('a different successor execution cannot clear an unresolved historical Pi write',async()=>{
+test('legacy Pi uncertainty is reconciled on explicit retry even with a different successor',async()=>{
  const h=harness();try{
   const {entryId}=await h.service.submitManual({url});await settle(h.service);const row=h.service.list()[0]!;
   const original:Entry={...row,source:'group',phase:'ISSUES',writePending:'Pi 提交检视意见',supersededBy:'successor'};
   const successor:Entry={...row,id:'successor',piExecution:{...row.piExecution!,entryId:'unrelated-execution'}};
   h.store.putRecord('group-mr-entry',entryId,original);h.store.putRecord('group-mr-entry',successor.id,successor);
-  await assert.rejects(h.service.submitManual({url}),/结果待核对/);assert.equal(h.state.piCalls,1);
+  await h.service.submitManual({url});await settle(h.service);assert.equal(h.state.piCalls,1);assert.equal(h.store.getRecord<Entry>('group-mr-entry',entryId)?.writePending,'');
  }finally{await h.close();}
 });
 

@@ -1,3 +1,4 @@
+const agentResult=(text:string,sha:string)=>text+'<ops-studio-review-result>'+JSON.stringify({sha,assessments:[],findings:[]})+'</ops-studio-review-result>';
 import {batchCommand} from '../src/infrastructure/process.js';
 import {CodehubSettings} from '../src/modules/autout/codehub-settings.js';
 import {mkdtempSync,rmSync} from 'node:fs';
@@ -53,7 +54,7 @@ test('group MR blocks on unresolved remote comments even when Pi claims they are
  const execute:typeof runProcess=async(args,_dir,_timeout,_log,onLine)=>{
   let value:unknown={};
   if(args[2]==='query-history-message')value=[{msgId:'2',sender:'u123',content:'https://codehub-y.huawei.com/MAE-M/Access/Demo/merge_requests/444'}];
-  else if(args[0]==='pi'){onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:JSON.stringify({ok:true,summary:'通过',findings:[],resolvedDiscussionIds:['mine']})}}),false);onLine?.(JSON.stringify({type:'agent_end'}),false);return{exitCode:0,output:''};}
+  else if(args[0]==='pi'){onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:agentResult('通过',sha)}}),false);onLine?.(JSON.stringify({type:'agent_end'}),false);return{exitCode:0,output:''};}
   else if(args[1]==='user')value={username:'u123'};
   else if(args[2]==='view')value={iid:444,state:'opened',sha,approval_merge_request_reviewers:[]};
   else if(args[2]==='gate')value={ci_state_passed:true,approval_reviewers_required_passed:false};
@@ -278,17 +279,17 @@ test('Pi findings are reported despite failed CI; passed Pi waits before all Cod
  }
 });
 
-test('Pi accepts natural text without JSON and waits for a terminal RPC event',async()=>{
+test('Pi requires a structured result and waits for a terminal RPC event',async()=>{
  for(const completed of [true,false]){
   const store=new TaskStore(':memory:'),sha='a'.repeat(40);
   const service=new GroupMrService(store,async(args,_dir,_timeout,_log,onLine,input)=>{
-   assert.ok(!args.includes('--no-tools'));assert.ok(!args.includes('--no-extensions'));assert.match(input??'',/codehub-cli/);assert.doesNotMatch(input??'',/返回结果 JSON/);
-   onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'检视完成，已提交意见。'}}),false);
+   assert.ok(!args.includes('--no-tools'));assert.ok(args.includes('--no-extensions'));assert.ok(args.some(a=>a.endsWith('pi-review-guard.js')));assert.match(input??'',/codehub-cli/);assert.doesNotMatch(input??'',/返回结果 JSON/);
+   onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:agentResult('检视完成，已提交意见。',sha)}}),false);
    if(completed){onLine?.(JSON.stringify({type:'agent_end'}),false);onLine?.(JSON.stringify({type:'extension_ui_request',method:'setStatus'}),false);}
    return {exitCode:0,output:''};
   });
   const entry={id:'test',repo:'MAE-M/Access/Demo',iid:'444',url:'https://codehub-y.huawei.com/MAE-M/Access/Demo/merge_requests/444',sha,previousSha:'',messageId:'1',sender:'other',shortcut:false,phase:'PI' as const,status:'',detail:'',createdAt:new Date().toISOString(),updatedAt:'',writePending:'',events:[]};
-  try{if(completed)await service['runPi'](entry,'',[]);else await assert.rejects(service['runPi'](entry,'',[]),/未正常结束/);assert.equal(entry.writePending,'Pi 提交检视意见');assert.equal(service.list()[0]?.piOutput,'检视完成，已提交意见。');}
+  try{if(completed)await service['runPi'](entry,'',[]);else await assert.rejects(service['runPi'](entry,'',[]),/未正常结束/);assert.equal(entry.writePending,completed?'Pi 提交检视意见':'');assert.equal(service.list()[0]?.piOutput,'检视完成，已提交意见。');}
   finally{await service.close();store.close();}
  }
 });
@@ -449,7 +450,7 @@ for(const state of ['open','empty','query-error'] as const)test('natural Pi repl
  const store=new TaskStore(':memory:'),sha='a'.repeat(40);let finished=false,piRuns=0;const writes:string[]=[];
  const service=new GroupMrService(store,async(args,_dir,_timeout,_log,onLine)=>{
   let value:unknown={};
-  if(args[0]==='pi'){piRuns++;finished=true;onLine?.(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:'检视完成，没有问题。'}]}]}),false);return {exitCode:0,output:''};}
+  if(args[0]==='pi'){piRuns++;finished=true;onLine?.(JSON.stringify({type:'agent_end',messages:[{role:'assistant',content:[{type:'text',text:agentResult('检视完成，没有问题。',sha)}]}]}),false);return {exitCode:0,output:''};}
   if(args[2]==='send-to-group')value={resultCode:0};
   if(args[2]==='view')value={iid:1,state:'opened',sha};
   if(args[2]==='review'){
@@ -484,6 +485,7 @@ test('MR queue shows all received entries, runs five, ingests while busy and iso
    const iid=String(input).match(/merge_requests\/(\d+)/)![1]!;started.push(iid);executing++;peak=Math.max(peak,executing);
    await new Promise<void>(resolve=>releases.set(iid,resolve));executing--;
    if(iid==='2')throw Error('simulated Pi failure for MR 2');
+   onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:agentResult('完成',sha)}}),false);
    onLine?.(JSON.stringify({type:'agent_end'}),false);return {exitCode:0,output:''};
   }else if(args[2]==='gate')value={ci_state_passed:false};
   else if(args[2]==='pipeline')value=[{id:1,status:'running',sha}];
@@ -503,7 +505,7 @@ test('MR queue shows all received entries, runs five, ingests while busy and iso
   assert.equal(service.list().length,8);assert.equal(service.summary().monitor.queuedCount,3);assert.equal(started.length,5);
   const queued=service.list().find(e=>e.iid==='7')!;assert.throws(()=>service.removeHistory(queued.id),/执行或排队/);
   releases.get('2')!();await tick();
-  assert.equal(service.summary().pending.find(e=>e.iid==='2')?.writePending,'Pi 提交检视意见');
+  assert.equal(service.summary().pending.find(e=>e.iid==='2')?.writePending,'');
   await waitForStarted(6);assert.ok(started.includes('6'));assert.equal(service.summary().monitor.activeCount,5);
   const error=errors.find(e=>e.source==='mr-processing');assert.equal(error?.iid,'2');assert.equal(error?.entryId,service.list().find(e=>e.iid==='2')?.id);
   releases.get('1')!();await waitForStarted(7);assert.ok(started.includes('7'));
@@ -677,7 +679,7 @@ test('incremental Pi prompt includes baseline and closed discussion IDs without 
  const store=new TaskStore(':memory:');let prompt='';
  const service=new GroupMrService(store,async(_args,_dir,_timeout,_log,onLine,input)=>{
   prompt=JSON.parse(input!).message;
-  onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'增量复检完成'}}),false);
+  onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:agentResult('增量复检完成','b'.repeat(40))}}),false);
   onLine?.(JSON.stringify({type:'agent_end'}),false);return {exitCode:0,output:''};
  });
  const e={id:'prompt-test',repo:'MAE-M/Access/Demo',iid:'1',url:'https://codehub-y.huawei.com/MAE-M/Access/Demo/merge_requests/1',sha:'b'.repeat(40),previousSha:'',messageId:'1',sender:'developer',shortcut:false,phase:'PI' as const,status:'',detail:'',createdAt:new Date().toISOString(),updatedAt:'',writePending:'',events:[]};

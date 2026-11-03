@@ -1,3 +1,4 @@
+const agentResult=(text:string,sha:string)=>text+'<ops-studio-review-result>'+JSON.stringify({sha,assessments:[],findings:[]})+'</ops-studio-review-result>';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {GroupMrService,type Entry} from '../src/modules/automation/group-mr.js';
@@ -119,13 +120,14 @@ test('resending a blocked MR preserves completion evidence and original ownershi
  const e=entry(),f=fixture(e,{notes:[discussion('new','reviewer','请核对 <!-- ops-studio-review:'+e.id+' -->')]});
  const cfg={enabled:false,groupId:'123456789',authorizedSender:'owner',repositoryPrefix:'MAE-M/Access/',intervalSeconds:10};
  try{
+  f.service['executeEntry']=async next=>{await f.service['recoverAgentAttempts']({...next,sha});};
   await f.service['accept']({id:'second-message',content:e.url,sender:'developer',quoteId:''},cfg);
   const successor=f.service.list().find(row=>row.id!==e.id)!;
-  assert.ok(successor);assert.deepEqual(successor.piExecution,e.piExecution);assert.equal(f.calls.length,0);
+  assert.ok(successor);assert.ok(f.calls.length>0);
   assert.equal(f.saved().supersededBy,successor.id);
-  await f.service['refreshReadiness'](successor);
+  await f.service['refreshReadiness'](f.saved());
   assert.equal(f.store.getRecord<Entry>('group-mr-entry',successor.id)!.writePending,'');
-  assert.equal(f.store.getRecord<Entry>('group-mr-entry',successor.id)!.piReview?.ok,false);
+  assert.equal(f.checkpoint()?.review.ok,false);
   const owned=f.store.getRecord<{entryId:string}>('group-mr-owned-discussion',repo+':1:new');
   assert.equal(owned?.entryId,e.id);assert.deepEqual(f.writes,[]);
  }finally{await f.close();}
@@ -179,7 +181,7 @@ for(const outcome of ['complete','missing-terminal','assistant-error','nonzero-e
   const started=store.getRecord<Entry>('group-mr-entry',e.id)!;
   assert.equal(started.piExecution?.sha,sha);assert.equal(started.piExecution?.completedAt,undefined);
   if(outcome==='execution-rejected')throw Error('Process interrupted');
-  onLine?.(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:outcome==='assistant-error'?'error':'stop',content:[{type:'text',text:'已读取本次变更。'}]}}),false);
+  onLine?.(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:outcome==='assistant-error'?'error':'stop',content:[{type:'text',text:agentResult('已读取本次变更。',sha)}]}}),false);
   if(outcome!=='missing-terminal')onLine?.(JSON.stringify({type:'agent_end'}),false);
   return {exitCode:outcome==='nonzero-exit'?124:0,output:''};
  });
@@ -188,7 +190,7 @@ for(const outcome of ['complete','missing-terminal','assistant-error','nonzero-e
   if(outcome==='complete')await service['runPi'](e,'',notes,'reviewer');
   else await assert.rejects(service['runPi'](e,'',notes,'reviewer'));
   const saved=store.getRecord<Entry>('group-mr-entry',e.id)!;
-  assert.equal(saved.writePending,'Pi 提交检视意见');assert.equal(saved.piExecution?.entryId,e.id);
+  assert.equal(saved.writePending,outcome==='complete'?'Pi 提交检视意见':'');assert.equal(saved.piExecution?.entryId,e.id);
   assert.equal(saved.piExecution?.author,'reviewer');assert.deepEqual(saved.piExecution?.discussionIds,['old-note']);
   assert.equal(!!saved.piExecution?.completedAt,outcome==='complete');assert.equal(saved.piReview,undefined);
  }finally{await service.close();store.close();}
@@ -201,7 +203,7 @@ test('successful Agent followed by transient discussion-read failure recovers wi
   let value:unknown={};
   if(args[0]==='pi'){
    piRuns++;
-   onLine?.(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'检视完成，无新增问题。'}]}}),false);
+   onLine?.(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:agentResult('检视完成，无新增问题。',sha)}]}}),false);
    onLine?.(JSON.stringify({type:'agent_end'}),false);return {exitCode:0,output:''};
   }
   if(args[0]!=='codehub-cli'){writes.push([...args]);throw Error('Unexpected external write');}

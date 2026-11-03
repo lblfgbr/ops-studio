@@ -42,17 +42,18 @@ for(const scenario of ['reply','fixed','unfixed','uncertain','foreign','self','s
 });
 for(const mode of ['reply','FIXED','UNFIXED','UNCERTAIN'] as const)test('跨轮次归属与闭环：'+mode,async()=>{
  const store=new TaskStore(':memory:');let piRuns=0,currentSha=sha;const resolved:string[]=[];let rows:ReturnType<typeof thread>[]=[];
- const execute:typeof runProcess=async(args,_dir,_timeout,_log,onLine,input)=>{
+ const execute:typeof runProcess=async(args,_dir,_timeout,_log,onLine,_input)=>{
   let value:unknown={};
   if(args[0]==='pi'){
-   piRuns++;const prompt=String(JSON.parse(input!).message);const marker=prompt.match(/<!-- ops-studio-review:[^>]+ -->/)![0];
-   if(piRuns===1){rows=[thread('mine'),thread('human')];rows[0]!.notes[0]!.body+='\n'+marker;}
-   onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'<ops-studio-review-result>'+JSON.stringify({sha:currentSha,assessments:piRuns===1?[]:[{id:'mine',status:mode,reason:'已检查当前代码'}]})+'</ops-studio-review-result>'}}),false);onLine?.(JSON.stringify({type:'agent_end'}),false);
+   piRuns++;
+   onLine?.(JSON.stringify({type:'message_update',assistantMessageEvent:{type:'text_delta',delta:'<ops-studio-review-result>'+JSON.stringify({sha:currentSha,assessments:piRuns===1?[]:[{id:'mine',status:mode,reason:'已检查当前代码'}],findings:piRuns===1?[{path:'a.ts',line:1,body:'缺少判空'}]:[]})+'</ops-studio-review-result>'}}),false);onLine?.(JSON.stringify({type:'agent_end'}),false);
   }else if(args[1]==='user')value={username:'owner'};
   else if(args[2]==='view')value={iid:1,state:'opened',sha:currentSha};
   else if(args[2]==='review'&&args[3]==='list')value=rows;
+  else if(args[2]==='changes')value={changes:[{new_path:'a.ts',diff:'@@ -0,0 +1 @@\n+new'}]};
+  else if(args[3]==='create'&&!args.includes('--help')){rows=[thread('mine'),thread('human')];rows[0]!.notes[0]!.body=args[args.indexOf('--body')+1]!;Object.assign(rows[0]!.notes[0]!,{position:{new_path:'a.ts',new_line:1}});}
   else if(args[2]==='review'&&args[3]==='resolve'){resolved.push(args[5]!);rows.find(r=>r.id===args[5])!.resolved=true;}
-  else if(args.includes('--help'))return{exitCode:0,output:'--quote-message-id'};
+  else if(args.includes('--help'))return{exitCode:0,output:args[2]==='review'?`mr review ${args[3]} <iid>${args[3]==='reply'?' <discussion-id>':''}\n --body <body>\n --project <repo>\n --path <path>\n --line <line>`:'--quote-message-id'};
   else if(args[2]==='send-to-group')value={resultCode:0};
   return{exitCode:0,output:JSON.stringify(value)};
  };
