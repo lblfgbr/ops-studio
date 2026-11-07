@@ -41,7 +41,7 @@ test('acknowledging Agent results reloads cached workspace and restores discussi
  assert.doesNotMatch(d.querySelector('.group-mr-detail').textContent,/服务重启，原执行中断|结果待核对/)
  assert.equal(d.querySelector('[data-mrw-resolve="note"]').disabled,false)
  assert.equal(d.querySelector('[data-mrw-thread="note"]').disabled,false)
- d.querySelector('[data-mr-view="notes"]').click();assert.ok(d.querySelector('[data-mrw-continue]'))
+ d.querySelector('[data-mr-view="notes"]').click();assert.ok(d.querySelector('[data-group-mr-action=retry]'))
  assert.equal(writes.length,1)
 })
 

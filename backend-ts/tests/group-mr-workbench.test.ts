@@ -6,13 +6,21 @@ import {GroupMrService,type Entry} from '../src/modules/automation/group-mr.js';
 import {reviewThreads,reviewFiles,reviewFileText,fullReviewDiff,recoveredReviewDiff,addedLines,supportsReviewCommand} from '../src/modules/automation/group-mr-workbench.js';
 const sha='a'.repeat(40),other='b'.repeat(40),diff='@@ -1,2 +1,3 @@\n old\n+new\n tail';
 const help=(kind:string)=>`Usage: codehub-cli mr review ${kind} <iid>${kind==='reply'?' <discussion-id>':''} [options]\nOptions:\n  -p, --project <project>\n  --body <body>\n  --path <path>\n  --line <line>`;
+const cobraHelp=(kind:string)=>`Usage:
+  codehub-cli mr review ${kind} <mr-iid>${kind==='reply'?' <discussion-id>':''} [flags]
+Flags:
+  -b, --body string              Review comment content
+  -F, --body-file string         Read body from file
+      --path string              File path for line-level review
+      --line lineRange           Line number in new version (N) or range (N-M)
+  -p, --project string           Project ID or path`;
 function fixture(mode='ok'){
  const store=new TaskStore(':memory:');let resolved=false,reply='',extra=false,head=sha,views=0;
  const writes:string[][]=[],reads:string[][]=[];
  const notes=()=>[{id:'thread',resolved,notes:[{id:'1',body:'Please fix',resolvable:true,author:{username:'reviewer'},position:{new_path:'src/a.ts',new_line:2,head_sha:sha}},...(reply?[{id:'2',body:reply,author:{username:'owner'}}]:[]),...(extra?[{id:'3',body:'changed concurrently',author:{username:'developer'}}]:[])]}];
  const service=new GroupMrService(store,async args=>{
   let value:unknown={};
-  if(args.includes('--help'))return {exitCode:0,output:mode==='unsupported'?'unknown command':help(args[3]!)};
+  if(args.includes('--help'))return {exitCode:0,output:mode==='unsupported'?'unknown command':cobraHelp(args[3]!)};
   if(args[2]==='view'){views++;value={iid:1,diff_refs:mode==='missing-base'?undefined:{base_sha:other},state:mode==='closed'?'closed':'opened',sha:mode==='changed-read'&&views>1?other:head};}
   else if(args[2]==='changes'){
    if(mode==='capture'&&!args.includes('--jq'))return {exitCode:0,output:'partial',outputTruncated:true};
@@ -156,4 +164,29 @@ test('expired position is retained and unresolved history can close against refr
   assert.equal(f.writes.length,1);assert.equal(f.writes[0]![3],'resolve');assert.equal(f.store.getRecord<Entry>('group-mr-entry',f.e.id)!.sha,sha);
   await assert.rejects(f.service.reviewWorkspaceAction(f.e.id,{action:'create',sha:other,operationId:randomUUID(),path:'src/a.ts',line:2,body:'new'}),/提交已变化/);
  }finally{await f.shutdown();}
+});
+
+test('review capabilities accept Cobra types and legacy help but reject missing or incompatible arguments',()=>{
+ for(const kind of ['reply','create'] as const){
+  for(const text of [cobraHelp(kind),help(kind),help(kind).replaceAll(/<([^>]+)>/g,'[$1]').replace('[iid]','<iid>').replace('[discussion-id]','<discussion-id>'), '\x1b[32m'+cobraHelp(kind).replaceAll('\n','\r\n')+'\x1b[0m'])assert.equal(supportsReviewCommand(text,kind),true);
+  for(const flag of ['body','project',...(kind==='create'?['path','line']:[])]){
+   const missing=cobraHelp(kind).split('\n').filter(line=>!line.includes('--'+flag+' ')).join('\n');
+   assert.equal(supportsReviewCommand(missing,kind),false,flag);
+   assert.equal(supportsReviewCommand(missing+'\nExamples: use --'+flag+' string',kind),false);
+  }
+  assert.equal(supportsReviewCommand(cobraHelp(kind).replace('<mr-iid>','<other>'),kind),false);
+  assert.equal(supportsReviewCommand(cobraHelp(kind).replace('--body string','--body bool'),kind),false);
+  assert.equal(supportsReviewCommand(cobraHelp(kind).replace('--body string','--body        Submit content'),kind),false);
+ }
+ assert.equal(supportsReviewCommand(cobraHelp('reply').replace('<discussion-id>','<note-id>'),'reply'),false);
+});
+test('capability diagnostics distinguish help failures from unmatched help',async()=>{
+ const f=fixture('unsupported');try{
+  const result=await f.service.reviewWorkspace(f.e.id);
+  assert.match(result!.capabilities.reason,/回复评论：CLI 帮助中的命令参数未匹配/);
+  assert.match(result!.capabilities.reason,/新增行评论：CLI 帮助中的命令参数未匹配/);
+ }finally{await f.shutdown();}
+ const store=new TaskStore(':memory:');
+ const service=new GroupMrService(store,async()=>({exitCode:124,output:'timeout'}));
+ try{const capabilities=await service['reviewCapabilities']();assert.equal(capabilities.create,false);assert.match(capabilities.reason,/CLI 帮助命令执行失败/);assert.doesNotMatch(capabilities.reason,/参数未匹配/);}finally{await service.close();store.close();}
 });

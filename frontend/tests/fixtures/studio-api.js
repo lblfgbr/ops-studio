@@ -144,7 +144,12 @@ r.phase='DONE';r.status='检视、审核与合并已完成';r.mergedAt=now();r.e
 },400);
 return ok(r)}
 if(action==='merge'){if(!body.confirmed)return fail('请明确确认合入');if(r.phase==='NO_PERMISSION')return fail('模拟账号没有合并权限');if(!w.readiness.ready||r.humanReview?.decision!=='pass')return fail('请完成检视意见、流水线与人工审核');r.phase='DONE';r.status='已合入';r.mergedAt=now();pending.splice(pending.indexOf(r),1);history.unshift(r);return ok(r)}
-if(['continue-review','retry','refresh','recheck'].includes(action)){r.phase=w.readiness.ready?'HUMAN':'ISSUES';r.status='模拟重新检查完成';return ok(r)}r.events.push({at:now(),stage:action,message:'模拟执行 '+action});return ok(r)}
+if(action==='retry'){
+if(r.running||r.queued)return ok({entryId:r.id,duplicate:true},202);
+const next={...clone(r),id:'mr-retry-'+Date.now(),phase:'QUEUED',queued:true,status:'等待重新执行',updatedAt:now(),attempts:[{id:r.id,phase:r.phase,status:r.status,events:r.events},...(r.attempts||[])]};pending.splice(pending.indexOf(r),1,next);
+setTimeout(()=>{next.queued=false;next.phase=w.readiness.ready?'HUMAN':'ISSUES';next.status='模拟重新检查完成';next.events.push({time:now(),phase:next.phase,message:next.status})},350);
+return ok({entryId:next.id,duplicate:false},202)}
+if(['continue-review','refresh','recheck'].includes(action)){r.phase=w.readiness.ready?'HUMAN':'ISSUES';r.status='模拟重新检查完成';return ok(r)}r.events.push({at:now(),stage:action,message:'模拟执行 '+action});return ok(r)}
 if(p.startsWith('/api/automation/effectiveness')){
   const records=[...pending,...history],reviews=knowledge.reviews,waits=reviews.map(review=>review.waitMs).filter(Number.isFinite).sort((a,b)=>a-b);
   const percentile=portion=>waits.length?waits[Math.ceil(waits.length*portion)-1]:null;

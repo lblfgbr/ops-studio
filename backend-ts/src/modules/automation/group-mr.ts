@@ -120,12 +120,13 @@ function retryableRead(args:readonly string[]):boolean{
  return args[1]==='user'||(args[1]==='repo'&&args[2]==='file'&&args[3]==='get')||(args[1]==='mr'&&(['view','gate','pipeline','changes'].includes(args[2]??'')||(args[2]==='review'&&args[3]==='list')));
 }
 interface ExecutionContext {entry:Entry|undefined;command:string;diagnostic:Record<string,unknown>;trace:Record<string,unknown>[]}
-interface QueuedJob {entry:Entry;persistQueue:boolean;priority:'manual'|'normal'|'background';run:()=>Promise<void>;resolve:()=>void;reject:(error:unknown)=>void}
+interface QueuedJob {entry:Entry;persistQueue:boolean;readOnly:boolean;priority:'manual'|'normal'|'background';run:()=>Promise<void>;resolve:()=>void;reject:(error:unknown)=>void}
 export class GroupMrService {
  readonly knowledge:ReviewKnowledge;private background=new Set<Promise<void>>();
  private groupReplyTails=new Map<string,Promise<void>>();
  private groupReplyReadyAt=new Map<string,number>();
  private reviewJobs=new Map<string,ReviewJob>();
+ private activeReads=new Set<string>();private readOnlyLanes=new Set<string>();private workspaceReads=new Map<string,Promise<ReviewWorkspace>>();private retryEntries=new Map<string,Entry>();
  private timer:NodeJS.Timeout;private busy=false;private closing=false;private active=new Set<string>();private initialised=false;private lastPoll=0;private controller=new AbortController();private pollPromise:Promise<void>|undefined;private contexts=new AsyncLocalStorage<ExecutionContext>();private monitorContext:ExecutionContext={entry:undefined,command:'',diagnostic:{},trace:[]};private workers=new Map<string,ExecutionContext>();private queue:QueuedJob[]=[];private reserved=new Set<string>();readonly concurrency=5;private stateChecks=new Map<string,number>();private stateJobs=new Map<string,Promise<void>>();private lastLoginAt=new Map<string,number>();private logins=new Map<string,Promise<void>>();
  private get context(){return this.contexts.getStore()??this.monitorContext;}
  private get activeCommand(){return this.context.command;} private set activeCommand(value:string){this.context.command=value;}
@@ -133,30 +134,30 @@ export class GroupMrService {
  private get currentEntry(){return this.context.entry;} private set currentEntry(value:Entry|undefined){this.context.entry=value;}
  private get trace(){return this.context.trace;} private set trace(value:Record<string,unknown>[]){this.context.trace=value;}
  // Reserve each MR across waiting and running states; every continuation uses this pool.
- private enqueue(entry:Entry,run:()=>Promise<void>,persistQueue=true,priority:QueuedJob['priority']='normal'):Promise<void>{
+ private enqueue(entry:Entry,run:()=>Promise<void>,persistQueue=true,priority:QueuedJob['priority']='normal',readOnly=false):Promise<void>{
   const key=entry.repo+':'+entry.iid;
   if(this.closing)return Promise.reject(Error('服务正在停止'));
-  if(this.reserved.has(key)&&!(priority==='manual'&&this.stateJobs.has(key)&&!this.queue.some(job=>job.entry.repo+':'+job.entry.iid===key&&job.priority!=='background')))return Promise.reject(Error('MR 已在排队或执行中'));
+  if(this.reserved.has(key)&&!(priority==='manual'&&(this.stateJobs.has(key)||this.readOnlyLanes.has(key))&&!this.queue.some(job=>job.entry.repo+':'+job.entry.iid===key&&job.priority!=='background'&&!job.readOnly)))return Promise.reject(Error('MR 已在排队或执行中'));
   // Inspection jobs reserve the MR too, but must not turn a waiting workflow into interrupted work on restart.
-  this.reserved.add(key);if(persistQueue){entry.queued=true;this.save(entry);}
-  const job=new Promise<void>((resolve,reject)=>{this.queue.push({entry,persistQueue,priority,run,resolve,reject});});
+  this.reserved.add(key);if(readOnly)this.readOnlyLanes.add(key);if(persistQueue){entry.queued=true;this.save(entry);}
+  const job=new Promise<void>((resolve,reject)=>{this.queue.push({entry,persistQueue,readOnly,priority,run,resolve,reject});});
   this.background.add(job);void job.then(()=>this.background.delete(job),()=>this.background.delete(job));
   this.drain();return job;
  }
  private drain(){
   while(!this.closing&&this.active.size<this.concurrency&&this.queue.length){
    const rank={manual:0,normal:1,background:2};
-   const candidate=this.queue.filter(job=>!this.active.has(job.entry.repo+':'+job.entry.iid)&&(job.priority!=='background'||this.active.size<this.concurrency-1)).sort((a,b)=>rank[a.priority]-rank[b.priority])[0];
+   const candidate=this.queue.filter((job,index)=>!this.queue.slice(0,index).some(previous=>previous.entry.repo===job.entry.repo&&previous.entry.iid===job.entry.iid)&&!this.active.has(job.entry.repo+':'+job.entry.iid)&&(job.priority!=='background'||this.active.size<this.concurrency-1)).sort((a,b)=>rank[a.priority]-rank[b.priority])[0];
    if(!candidate)break;
    const job=this.queue.splice(this.queue.indexOf(candidate),1)[0]!;
    const entry=this.reviewJobs.has(job.entry.id)?this.store.getRecord<Entry>('group-mr-entry',job.entry.id)??job.entry:job.entry,key=entry.repo+':'+entry.iid;
-   if(job.persistQueue){entry.queued=false;this.save(entry);}this.active.add(key);
+   if(job.persistQueue){entry.queued=false;this.save(entry);}this.active.add(key);if(job.readOnly)this.activeReads.add(key);
    // Async-local diagnostics prevent overlapping CLI calls from attributing errors to another MR.
    const context:ExecutionContext={entry,command:'',diagnostic:{},trace:[]};this.workers.set(key,context);
    void this.contexts.run(context,async()=>{
     let failure:unknown;
     try{await job.run();}catch(error){failure=error;}
-    finally{this.active.delete(key);if(!this.queue.some(job=>job.entry.repo+':'+job.entry.iid===key))this.reserved.delete(key);this.workers.delete(key);this.drain();}
+    finally{if(job.readOnly){this.readOnlyLanes.delete(key);this.activeReads.delete(key);}this.active.delete(key);if(!this.queue.some(job=>job.entry.repo+':'+job.entry.iid===key))this.reserved.delete(key);this.workers.delete(key);this.drain();}
     if(failure)job.reject(failure);else job.resolve();
    });
   }
@@ -205,6 +206,48 @@ export class GroupMrService {
   void this.enqueue(entry,()=>this.executeEntry(entry,cfg,true)).catch(()=>{});
   return {entryId:entry.id,duplicate:false};
  }
+ // Explicit UI retry keeps the original attempt for audit and never waits on remote I/O at acceptance.
+ retryRecord(id:string,value:unknown){
+  const {sha}=z.object({sha:z.union([reviewSha,z.literal('')])}).strict().parse(value);
+  const old=this.store.getRecord<Entry>('group-mr-entry',id);
+  if(!old)throw Object.assign(Error('MR 记录不存在'),{statusCode:404});
+  if(this.closing)throw Object.assign(Error('服务正在停止，请稍后重试'),{statusCode:503});
+  const key=old.repo+':'+old.iid,retry=this.retryEntries.get(key);
+  if(retry)return {entryId:retry.id,duplicate:true};
+  if(old.supersededBy||this.store.getRecord('group-mr-hidden',id))throw Object.assign(Error('记录已替代或删除，请刷新列表'),{statusCode:409});
+  if(sha!==old.sha)throw Object.assign(Error('记录提交已变化，请刷新后重新执行'),{statusCode:409});
+  const queued=this.queue.find(job=>job.entry.repo===old.repo&&job.entry.iid===old.iid&&!job.readOnly&&job.priority!=='background');
+  if(queued||this.reserved.has(key)&&!this.readOnlyLanes.has(key)&&!this.stateJobs.has(key))return {entryId:queued?.entry.id??old.id,duplicate:true};
+  if(!['ISSUES','FAILED','NO_PERMISSION','INTERRUPTED','PIPELINE'].includes(old.phase))throw Object.assign(Error('当前状态无需重新执行，请刷新查看进度'),{statusCode:409});
+  const cfg=this.configuration(),now=new Date().toISOString();
+  const entry:Entry={...structuredClone(old),id:randomUUID(),previousSha:old.sha,shortcut:false,phase:'QUEUED',stage:'PI',status:'重新执行已受理，排队核对最新提交',detail:'',createdAt:now,updatedAt:now,events:[{time:now,phase:'QUEUED',message:'用户手动重新执行，原失败记录已保留'}],pipelinePassed:false,queued:true};
+  delete entry.supersededBy;delete entry.reviewJob;delete entry.readiness;delete entry.reply;
+  this.retryEntries.set(key,entry);this.save(entry);old.supersededBy=entry.id;this.save(old);
+  void this.enqueue(entry,async()=>{
+   try{
+    // A read already in flight may have reconciled the prior attempt after acceptance.
+    const previous=this.store.getRecord<Entry>('group-mr-entry',old.id)!;
+    entry.writePending=previous.writePending;
+    for(const field of ['approvalPending','manualReviewPending','piExecution','piReview','humanReview'] as const){delete entry[field];Object.assign(entry,previous[field]===undefined?{}:{[field]:structuredClone(previous[field])});}
+    const remote=await this.view(entry);
+    if(this.archiveRemote(entry,remote))return;
+    if(remote.state!=='opened')throw Error('MR 不处于可处理状态');
+    const head=reviewSha.parse(this.head(remote));
+    if(entry.manualReviewPending)this.reconcileManualReview(entry,await this.workbenchNotes(entry));
+    if(['检视','审核'].includes(entry.writePending))this.reconcileApproval(entry,remote,await this.gate(entry));
+    await this.reconcileClosure(entry);
+    const related=this.list().filter(r=>r.repo===entry.repo&&r.iid===entry.iid);
+    const blocked=related.find(r=>r.writePending&&!this.agentPending(r)&&!this.pendingConfirmedBySuccessor(r,related));
+    if(entry.writePending&&!this.agentPending(entry)||blocked)throw Error('上次'+(entry.writePending||blocked!.writePending).replace(/\bPi\b/g,'Agent')+'结果仍待核对，请确认远端状态后继续；未重复提交');
+    entry.sha=head;
+    if(head!==previous.sha){delete entry.humanReview;delete entry.humanStartedAt;delete entry.reviewAssessment;delete entry.piExecution;delete entry.rolesPrepared;delete entry.humanReviewSkipped;delete entry.notification;}
+    this.mark(entry,'PI',head===previous.sha?'已核对当前提交，重新执行原检视流程':'已读取最新提交，重新检视当前代码');
+    await this.executeEntry(entry,cfg,false);
+   }catch(error){const reason=error instanceof Error?error.message:'重新执行失败';this.errorLog('manual-retry',reason,error);this.mark(entry,this.stoppedPhase(entry),reason);}
+   finally{await this.notifyManualOutcome(entry);}
+  },true,'manual').catch(error=>{entry.queued=false;this.mark(entry,'INTERRUPTED',error instanceof Error?error.message:'重新执行未启动');}).finally(()=>this.retryEntries.delete(key));
+  return {entryId:entry.id,duplicate:false};
+ }
  private pendingConfirmedBySuccessor(entry:Entry,related:Entry[]){
   if(entry.manualReviewPending){
    const pending=entry.manualReviewPending,confirmed=this.store.getRecord<{hash:string;status:string}>('group-mr-review-operation',entry.repo+':'+entry.iid+':'+pending.operationId);
@@ -233,10 +276,10 @@ export class GroupMrService {
    const e=group.find(r=>!r.supersededBy)??group[0]!;
    // Hiding the current MR must not resurrect an older attempt as a new row.
    if(this.store.getRecord('group-mr-hidden',e.id))return [];
-   return [{...e,running:this.active.has(e.repo+':'+e.iid),checkingRemote:this.stateJobs.has(e.repo+':'+e.iid),attempts:group.map(r=>({id:r.id,phase:r.phase,stage:r.stage,status:r.status,detail:r.detail,sha:r.sha,createdAt:r.createdAt,updatedAt:r.updatedAt,events:r.events}))}];
+   return [{...e,running:this.active.has(e.repo+':'+e.iid)&&!this.activeReads.has(e.repo+':'+e.iid),checkingRemote:this.stateJobs.has(e.repo+':'+e.iid),attempts:group.map(r=>({id:r.id,phase:r.phase,stage:r.stage,status:r.status,detail:r.detail,sha:r.sha,createdAt:r.createdAt,updatedAt:r.updatedAt,events:r.events}))}];
   });
  }
- summary(){const today=new Date().toISOString().slice(0,10),rows=this.grouped(),pending=rows.filter(e=>!['DONE','CLOSED'].includes(e.phase)),history=rows.filter(e=>['DONE','CLOSED'].includes(e.phase));return {config:this.configuration(),pending,history,monitor:{...this.monitor(),state:this.active.size?'processing':this.monitor().state,running:this.busy||this.active.size>0,activeCount:this.active.size,queuedCount:this.queue.length,concurrency:this.concurrency,command:[this.monitorContext.command,...[...this.workers.values()].map(c=>c.command)].filter(Boolean).join(' · '),logs:this.store.getRecord<MonitorEvent[]>('group-mr-log','main')??[]},metrics:{pending:pending.length,issues:pending.filter(e=>e.phase==='ISSUES'&&!e.writePending).length,mergedToday:history.filter(e=>e.phase==='DONE'&&e.updatedAt.startsWith(today)).length,mergedTotal:history.filter(e=>e.phase==='DONE').length}};}
+ summary(){const today=new Date().toISOString().slice(0,10),rows=this.grouped(),pending=rows.filter(e=>!['DONE','CLOSED'].includes(e.phase)),history=rows.filter(e=>['DONE','CLOSED'].includes(e.phase)),activeCount=this.active.size-this.activeReads.size,queuedCount=this.queue.filter(job=>!job.readOnly).length;return {config:this.configuration(),pending,history,monitor:{...this.monitor(),state:activeCount?'processing':this.monitor().state,running:this.busy||activeCount>0,activeCount,queuedCount,concurrency:this.concurrency,command:[this.monitorContext.command,...[...this.workers.entries()].filter(([key])=>!this.activeReads.has(key)).map(([,c])=>c.command)].filter(Boolean).join(' · '),logs:this.store.getRecord<MonitorEvent[]>('group-mr-log','main')??[]},metrics:{pending:pending.length,issues:pending.filter(e=>e.phase==='ISSUES'&&!e.writePending).length,mergedToday:history.filter(e=>e.phase==='DONE'&&e.updatedAt.startsWith(today)).length,mergedTotal:history.filter(e=>e.phase==='DONE').length}};}
  // Reconcile by reading CodeHub; only the first confirmed merge result may notify the group.
  refreshRemoteStates(){
   if(this.closing)return;
@@ -244,7 +287,7 @@ export class GroupMrService {
    .sort((a,b)=>(this.stateChecks.get(a.repo+':'+a.iid)??0)-(this.stateChecks.get(b.repo+':'+b.iid)??0)).slice(0,Math.max(0,this.concurrency-1-this.active.size));
   for(const row of candidates){
    const e=this.store.getRecord<Entry>('group-mr-entry',row.id)!;this.stateChecks.set(e.repo+':'+e.iid,Date.now());
-   const key=e.repo+':'+e.iid;const job=this.enqueue(e,async()=>{try{const remote=await this.view(e);const archived=this.archiveRemote(e,remote);if(!archived){await this.refreshReadiness(e,remote);await this.reconcileClosure(e);if(e.source==='manual'&&e.phase==='PIPELINE'&&e.pipelineWaiting&&!e.writePending&&!this.reviewJobs.has(e.id)&&this.head(remote)===e.sha)await this.executeEntry(e,this.configuration(),false);}if(archived&&remote.state==='merged'){try{await this.replyMerged(e,this.configuration(),'已核对 CodeHub，MR 已合入。');}catch{e.detail='MR 已合入，但群消息回复结果未确认，请核对 WeLink';this.save(e);}}}catch{e.readiness={sha:'',checkedAt:new Date().toISOString(),ready:false,reason:'远端状态读取失败，请刷新核对'};this.save(e);this.recordLog('error','MR 远端状态查询失败，保留当前状态');}finally{await this.notifyManualOutcome(e);}},false,'background').catch(()=>{});
+   const key=e.repo+':'+e.iid;const job=this.enqueue(e,async()=>{try{const remote=await this.view(e);const archived=this.archiveRemote(e,remote);if(!archived){await this.refreshReadiness(e,remote);await this.reconcileClosure(e);if(e.source==='manual'&&e.phase==='PIPELINE'&&e.pipelineWaiting&&!e.writePending&&!this.reviewJobs.has(e.id)&&!this.retryEntries.has(e.repo+':'+e.iid)&&this.head(remote)===e.sha)await this.executeEntry(e,this.configuration(),false);}if(archived&&remote.state==='merged'){try{await this.replyMerged(e,this.configuration(),'已核对 CodeHub，MR 已合入。');}catch{e.detail='MR 已合入，但群消息回复结果未确认，请核对 WeLink';this.save(e);}}}catch{e.readiness={sha:'',checkedAt:new Date().toISOString(),ready:false,reason:'远端状态读取失败，请刷新核对'};this.save(e);this.recordLog('error','MR 远端状态查询失败，保留当前状态');}finally{await this.notifyManualOutcome(e);}},false,'background').catch(()=>{});
    this.stateJobs.set(key,job);void job.then(()=>this.stateJobs.delete(key));
   }
  }
@@ -328,8 +371,15 @@ export class GroupMrService {
  private async workbenchNotes(e:Entry){return reviewThreads(await this.code(['mr','review','list',e.iid,'-p',e.repo]));}
  private async reviewCapabilities():Promise<ReviewCapabilities>{
   const supported={reply:false,create:false,reason:''};
-  for(const kind of ['reply','create'] as const){try{supported[kind]=supportsReviewCommand(await this.command(['codehub-cli','mr','review',kind,'--help'],15000),kind);}catch{/* Unknown CLI versions remain read-only for this operation. */}}
-  if(!supported.reply||!supported.create)supported.reason='当前 CLI 未确认支持回复或新增行评论，相关操作暂不可用；请核对 codehub-cli mr review --help';
+  const reasons:string[]=[];
+  for(const kind of ['reply','create'] as const){
+   const label=kind==='reply'?'回复评论':'新增行评论';
+   try{
+    supported[kind]=supportsReviewCommand(await this.command(['codehub-cli','mr','review',kind,'--help'],15000),kind);
+    if(!supported[kind])reasons.push(`${label}：CLI 帮助中的命令参数未匹配，请核对 codehub-cli mr review ${kind} --help`);
+   }catch{reasons.push(`${label}：CLI 帮助命令执行失败，请查看 group-mr-errors.jsonl 中 codehub-cli mr review ${kind} --help 的执行记录`);}
+  }
+  supported.reason=reasons.join('；');
   return supported;
  }
  private reconcileManualReview(e:Entry,notes:ReviewThread[]){
@@ -369,7 +419,12 @@ export class GroupMrService {
    return reviewFiles(await this.code(['mr','changes',e.iid,'-p',e.repo,'--jq','del(.changes[].diff, .changes[].patch)']));
   }
  }
- async reviewWorkspace(id:string){
+ reviewWorkspace(id:string):Promise<ReviewWorkspace>{
+  const existing=this.workspaceReads.get(id);if(existing)return existing;
+  const read=this.readReviewWorkspace(id);this.workspaceReads.set(id,read);
+  void read.then(()=>this.workspaceReads.delete(id),()=>this.workspaceReads.delete(id));return read;
+ }
+ private async readReviewWorkspace(id:string){
   const e=this.workbenchEntry(id);let result:ReviewWorkspace|undefined;
   await this.enqueue(e,async()=>{
    delete e.readiness;this.save(e);
@@ -381,7 +436,7 @@ export class GroupMrService {
    const capabilities=await this.reviewCapabilities();
    e.reviewComments=threads.filter(n=>n.resolvable).map(({id,body,resolved})=>({id,body,resolved}));this.save(e);
    result={pipelinePassed:e.pipelinePassed===true,readiness:e.readiness!,sha,title:initial.title??'',state:initial.state,files,threads,capabilities,writePending:e.writePending,stale:sha!==e.sha,readAt:new Date().toISOString(),confirmedOperationId:e.manualReviewLastOperation||''};
-  },false).catch(error=>{delete e.readiness;this.save(e);throw error;});if(!result)throw Error('检视数据未完成');return result;
+  },false,'normal',true).catch(error=>{delete e.readiness;this.save(e);throw error;});if(!result)throw Error('检视数据未完成');return result;
  }
  private async readReviewFile(e:Entry,path:string,sha:string){
   let output:string;
@@ -414,7 +469,7 @@ export class GroupMrService {
    const latest=await this.workbenchHead(e,input.sha);
    if(file.unavailable&&initial.diff_refs?.base_sha!==latest.diff_refs?.base_sha)throw Object.assign(Error('MR 比较基线已变化，请刷新代码'),{statusCode:409});
    result={sha:input.sha,path:file.path,diff,originalDiff:file.diff};
-  },false);
+  },false,'normal',true);
   if(!result)throw Error('文件内容未读取完成');return result;
  }
  async reviewWorkspaceAction(id:string,value:unknown){
@@ -529,7 +584,7 @@ export class GroupMrService {
   if(previous&&['queued','checking','running'].includes(previous.status))throw Object.assign(Error('该 MR 已有审核任务，请等待任务完成'),{statusCode:409});
   this.validateHumanReview(e,input);
   const key=e.repo+':'+e.iid;
-  if(this.reserved.has(key)&&!this.stateJobs.has(key))throw Object.assign(Error('MR 正在执行或排队，请结束后再操作'),{statusCode:409});
+  if(this.reserved.has(key)&&!this.stateJobs.has(key)&&!this.readOnlyLanes.has(key))throw Object.assign(Error('MR 正在执行或排队，请结束后再操作'),{statusCode:409});
   const job:ReviewJob={id:randomUUID(),sha:input.sha,requestHash,status:'queued'};
   this.reviewJobs.set(id,job);e.reviewJob=job;this.save(e);
   // Acceptance is durable and local. Remote verification and approval run in the MR lane.
@@ -573,7 +628,7 @@ export class GroupMrService {
   const job=this.contexts.run({entry:this.store.getRecord<Entry>('group-mr-entry',record.entryId),command:'',diagnostic:{},trace:[]},async()=>{try{const changes=await this.code(['mr','changes',record.iid,'-p',record.repo]);const remote=await this.view(this.store.getRecord<Entry>('group-mr-entry',record.entryId)!);if(this.head(remote)!==record.sha)throw Error('提交变化');this.knowledge.queue(record,changes);}catch{record.knowledgeStatus='failed';record.knowledgeError='无法读取该提交改动，请手动重试';this.knowledge.saveReview(record);}}).finally(()=>this.background.delete(job));this.background.add(job);
  }
  retryKnowledge(id:string){const record=this.knowledge.reviews().find(r=>r.id===id);if(!record)throw Object.assign(Error('审核记录不存在'),{statusCode:404});if(record.knowledgeStatus!=='failed')throw Object.assign(Error('仅失败的整理可以重试'),{statusCode:409});record.knowledgeStatus='pending';this.knowledge.saveReview(record);this.startKnowledge(record);return record;}
- private save(e:Entry){const job=this.reviewJobs.get(e.id);if(job){e.reviewJob=job;e.queued=job.status==='queued';}e.updatedAt=new Date().toISOString();this.store.putRecord('group-mr-entry',e.id,e,e.createdAt);}
+ private save(e:Entry){const successor=this.store.getRecord<Entry>('group-mr-entry',e.id)?.supersededBy;if(successor)e.supersededBy=successor;const job=this.reviewJobs.get(e.id);if(job){e.reviewJob=job;e.queued=job.status==='queued';}e.updatedAt=new Date().toISOString();this.store.putRecord('group-mr-entry',e.id,e,e.createdAt);}
  private stoppedPhase(e:Entry):Phase{return this.closing?'INTERRUPTED':e.writePending?'ISSUES':'FAILED';}
  private mark(e:Entry,p:Phase,message:string){this.trace.push({time:new Date().toISOString(),event:'phase-change',from:e.phase,to:p});this.trace=this.trace.slice(-80);e.phase=p;if(['HUMAN','PIPELINE','PI','COMMENTS','REVIEW','APPROVE','MERGE'].includes(p))e.stage=p;e.status=message;e.events.push({time:new Date().toISOString(),phase:p,message});this.save(e);}
  private errorLog(source:string,message:string,error?:unknown){const e=this.currentEntry;this.logs.task('automation','group-mr-errors',{time:new Date().toISOString(),source,message,entryId:e?.id,repo:e?.repo,iid:e?.iid,sha:e?.sha,phase:e?.phase,stage:e?.stage,writePending:e?.writePending,pipelinePassed:e?.pipelinePassed,platform:process.platform,node:process.version,diagnostic:this.diagnostic,trace:this.trace,stack:error instanceof Error?error.stack?.split('\n').filter(line=>/^\s+at /.test(line)).slice(0,15):undefined});}
@@ -1041,6 +1096,7 @@ ${scope}
 export function groupMrRoutes(app:FastifyInstance,service:GroupMrService){
  app.get('/api/automation/group-mr/records/:id/agent-findings',async request=>service.agentFindingStatus(z.object({id:z.string().min(1)}).parse(request.params).id));
  app.post('/api/automation/group-mr/records/:id/agent-findings/confirm-not-submitted',async request=>service.confirmAgentFindingNotSubmitted(z.object({id:z.string().min(1)}).parse(request.params).id,request.body));
+ app.post('/api/automation/group-mr/records/:id/retry',async(request,reply)=>reply.code(202).send(service.retryRecord(z.object({id:z.uuid()}).parse(request.params).id,request.body)));
  app.post('/api/automation/group-mr/submit',async(request,reply)=>reply.code(202).send(await service.submitManual(request.body)));
  app.get('/api/automation/group-mr/records/:id/workspace',async request=>service.reviewWorkspace(z.object({id:z.uuid()}).parse(request.params).id));
  app.get('/api/automation/group-mr/records/:id/file-context',async request=>service.reviewFileContext(z.object({id:z.uuid()}).parse(request.params).id,request.query));

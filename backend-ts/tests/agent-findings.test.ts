@@ -17,7 +17,7 @@ function harness(){
    return {exitCode:0,output:''};
   }
   let value:unknown={};
-  if(args.includes('--help'))return {exitCode:0,output:`codehub-cli mr review ${args[3]} <iid>${args[3]==='reply'?' <discussion-id>':''}\n --body <body>\n --project <project>\n --path <path>\n --line <line>`};
+  if(args.includes('--help'))return {exitCode:0,output:`codehub-cli mr review ${args[3]} <iid>${args[3]==='reply'?' <discussion-id>':''}\n -b, --body string\n -p, --project string\n --path string\n --line lineRange`};
   if(args[1]==='user')value={username:'reviewer'};
   else if(args[2]==='view')value={iid:1,state:'opened',sha:state.head};
   else if(args[3]==='list'){if(state.notesFail)throw Error('读取失败');value=state.notes;}

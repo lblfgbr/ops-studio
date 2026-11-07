@@ -106,7 +106,7 @@
 }
 
 /* UT and records use readable UI text and stable column alignment. */
-.studio-shell.ux-shell[data-ux-route="automation/auto-ut"],.studio-shell.ux-shell[data-ux-route="automation/tasks"]{font-family:"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;font-size:14px;line-height:1.6}
+.studio-shell.ux-shell[data-ux-route="automation/auto-ut"]>.variant-a-main,.studio-shell.ux-shell[data-ux-route="automation/tasks"]>.variant-a-main{font-family:"Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;font-size:14px;line-height:1.6}
 .studio-shell.ux-shell :is(.ut-task-detail,.ut-task-workspace) :is(button,input,select){font-family:inherit}
 .studio-shell.ux-shell :is(.ut-task-repo,.ut-task-stage) strong{font-size:14px;font-weight:600}
 .studio-shell.ux-shell :is(.ut-task-repo,.ut-task-stage) span,.studio-shell.ux-shell .ut-task-detail-head p{font-size:13px;line-height:1.6}
@@ -120,5 +120,5 @@
 .studio-shell.ux-shell .ut-task-detail-head>.button{flex:none;font-size:13px}
 .studio-shell.ux-shell .ut-task-detail-head h2{font-size:20px;font-weight:600;overflow-wrap:anywhere}
 @media(max-width:700px){.studio-shell.ux-shell .ut-task-context{margin:0 16px 16px;padding:16px}.studio-shell.ux-shell .ut-task-context .ut-task-meta{grid-template-columns:minmax(0,1fr)}.studio-shell.ux-shell .ut-task-detail-head{flex-wrap:wrap}}
-.studio-shell.ux-shell[data-ux-route="automation/auto-ut"] :is(.qw-table th,.qw-table td,.qw-fields label,.ut-version-card){font-family:inherit;font-size:14px;line-height:1.6}
-.studio-shell.ux-shell[data-ux-route="automation/auto-ut"] :is(button,input,select){font-family:inherit;font-size:13px}
+.studio-shell.ux-shell[data-ux-route="automation/auto-ut"]>.variant-a-main :is(.qw-table th,.qw-table td,.qw-fields label,.ut-version-card){font-family:inherit;font-size:14px;line-height:1.6}
+.studio-shell.ux-shell[data-ux-route="automation/auto-ut"]>.variant-a-main :is(button,input,select){font-family:inherit;font-size:13px}
