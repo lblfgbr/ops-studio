@@ -126,6 +126,12 @@ export function supportsReviewCommand(help:string,kind:'reply'|'create'):boolean
  help=stripVTControlCharacters(help);
  const usage=help.match(new RegExp('(?:codehub-cli\\s+)?mr\\s+review\\s+'+kind+'\\s+([^\\n]+)','i'))?.[1]??'';
  const args=[...usage.matchAll(/<([^>]+)>/g)].map(m=>m[1]!.toLowerCase().replaceAll('_','-'));
- const flags=help.split('\n').filter(s=>/^\s*(?:-[a-z],?\s*)?--[a-z]/i.test(s)).join('\n');
- return ['iid','mr-iid','mr-id','mr'].includes(args[0]??'')&&args.length===(kind==='reply'?2:1)&&(kind!=='reply'||['discussion-id','discussion'].includes(args[1]??''))&&/--body\s+[<[]/.test(flags)&&/(?:-p,?\s*)?--(?:project|repo|repository)\s+[<[]/.test(flags)&&(kind!=='create'||/--path\s+[<[]/.test(flags)&&/--line\s+[<[]/.test(flags));
+ // Read option declarations only: descriptions/examples must not advertise capabilities.
+ // Cobra uses bare types (string, lineRange); older help uses <value> or [value].
+ const flags=new Map<string,string>();
+ for(const line of help.split('\n')){
+  const match=/^\s*(?:-[a-z],?\s*)?--([a-z][a-z-]*)[ \t]+(<[^>\r\n]+>|\[[^\]\r\n]+\]|string|lineRange)(?=\s|$)/i.exec(line);
+  if(match)flags.set(match[1]!,match[2]!);
+ }
+ return ['iid','mr-iid','mr-id','mr'].includes(args[0]??'')&&args.length===(kind==='reply'?2:1)&&(kind!=='reply'||['discussion-id','discussion'].includes(args[1]??''))&&flags.has('body')&&['project','repo','repository'].some(flag=>flags.has(flag))&&(kind!=='create'||flags.has('path')&&flags.has('line'));
 }

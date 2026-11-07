@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createStudio } from './helpers/studio-harness.mjs';
+import { createStudio, studioPage } from './helpers/studio-harness.mjs';
 
 async function setup(t, route, options = {}) {
   const studio = await createStudio({ route, ...options });
@@ -151,4 +151,32 @@ test('studio settings directory and original configuration drawer remain usable 
   await click('[data-qw-close]');
   assert.equal(d.querySelector('.qw-drawer'), null);
   assert.equal(writes(requests).length, 0);
+});
+
+test('automation navigation keeps header and sidebar typography stable while UT and records retain content fonts', async t => {
+  const { w, d, find, route } = await setup(t, 'automation');
+  const html = await studioPage({ styles: true });
+  for (const match of html.matchAll(/<style>([\s\S]*?)<\/style>/g)) {
+    const style = d.createElement('style');
+    style.textContent = match[1];
+    d.head.append(style);
+  }
+  const typography = selector => {
+    const style = w.getComputedStyle(find(selector));
+    return [style.fontFamily, style.fontSize, style.fontWeight, style.lineHeight];
+  };
+  const chrome = ['.studio-topbar .pr-brand strong', '.studio-topbar .pr-global button',
+    '.variant-a-sidebar .variant-a-nav [data-automation-nav="schedules"]', '.variant-a-sidebar .ux-space-name'];
+  const baseline = chrome.map(typography);
+  for (const page of ['automation/auto-ut', 'automation/tasks', 'automation/group-mr', 'automation/quality', 'automation']) {
+    await route(page);
+    assert.deepEqual(chrome.map(typography), baseline, 'Shared navigation typography changed on ' + page);
+    if (['automation/auto-ut', 'automation/tasks'].includes(page)) {
+      const content = typography('.variant-a-main');
+      assert.match(content[0], /Segoe UI/);
+      assert.equal(content[1], '14px');
+      assert.equal(content[3], '1.6');
+    }
+    if (page === 'automation/auto-ut') assert.equal(typography('.variant-a-main button')[1], '13px');
+  }
 });
