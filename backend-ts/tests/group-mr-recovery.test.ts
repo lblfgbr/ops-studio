@@ -37,8 +37,8 @@ function fixture(e:Entry=entry(),options:Options={}){
  return {store,service,e,calls,writes,saved,checkpoint,close:async()=>{await service.close();store.close();}};
 }
 
-for(const route of ['readiness','workbench','background'] as const)test('completed Agent execution recovers by '+route+' after restart without replay',async()=>{
- const f=fixture();
+for(const marker of ['', 'Pi 提交检视意见'])for(const route of ['readiness','workbench','background'] as const)test('completed Agent execution recovers by '+route+' after restart without replay: '+(marker?'legacy marker':'direct submission'),async()=>{
+ const e=entry();e.writePending=marker;if(!marker)e.piExecution!.commentsRecordedAt=null;const f=fixture(e);
  try{
   assert.equal(f.calls.length,0);assert.equal(f.saved().phase,'INTERRUPTED');
   if(route==='readiness')await f.service['refreshReadiness'](f.saved());
@@ -47,6 +47,7 @@ for(const route of ['readiness','workbench','background'] as const)test('complet
   const saved=f.saved();
   assert.equal(saved.writePending,'');assert.equal(saved.phase,'ISSUES');
   assert.equal(saved.piReview?.source,'codehub');assert.equal(saved.piReview?.sha,sha);assert.equal(saved.piReview?.ok,true);
+  assert.ok(saved.piExecution?.commentsRecordedAt);
   assert.equal(f.checkpoint()?.sha,sha);assert.equal(saved.humanReview,undefined);
   assert.deepEqual(f.writes,[]);
  }finally{await f.close();}
@@ -72,6 +73,18 @@ test('completed Agent result can recover while the current pipeline is still run
   await f.service['refreshReadiness'](f.saved());const saved=f.saved();
   assert.equal(saved.writePending,'');assert.equal(saved.phase,'ISSUES');assert.equal(saved.piReview?.ok,true);
   assert.equal(saved.pipelinePassed,false);assert.equal(saved.readiness?.ready,false);assert.deepEqual(f.writes,[]);
+ }finally{await f.close();}
+});
+
+for(const phase of ['HUMAN','PIPELINE'] as const)test('legacy completed review keeps its waiting '+phase+' state after upgrade',async()=>{
+ const e=entry();e.writePending='';e.phase=phase;e.status='等待后续处理';e.pipelineWaiting=phase==='PIPELINE';
+ e.piReview={source:'codehub',sha,discussionKey:'[]',ok:true,findings:[],summary:'检视已完成',resolvedDiscussionIds:[]};
+ const f=fixture(e,{pipelinePassed:phase!=='PIPELINE'});
+ try{
+  f.store.putRecord('group-mr-review-checkpoint',repo+':1',{sha,review:e.piReview,completedAt});
+  await f.service['refreshReadiness'](f.saved());
+  assert.equal(f.saved().phase,phase);assert.equal(f.saved().status,'等待后续处理');
+  assert.equal(f.saved().piExecution?.commentsRecordedAt,undefined);assert.deepEqual(f.writes,[]);
  }finally{await f.close();}
 });
 
@@ -190,14 +203,14 @@ for(const outcome of ['complete','missing-terminal','assistant-error','nonzero-e
   if(outcome==='complete')await service['runPi'](e,'',notes,'reviewer');
   else await assert.rejects(service['runPi'](e,'',notes,'reviewer'));
   const saved=store.getRecord<Entry>('group-mr-entry',e.id)!;
-  assert.equal(saved.writePending,outcome==='complete'?'Pi 提交检视意见':'');assert.equal(saved.piExecution?.entryId,e.id);
+  assert.equal(saved.writePending,'');assert.equal(saved.piExecution?.entryId,e.id);
   assert.equal(saved.piExecution?.author,'reviewer');assert.deepEqual(saved.piExecution?.discussionIds,['old-note']);
-  assert.equal(!!saved.piExecution?.completedAt,outcome==='complete');assert.equal(saved.piReview,undefined);
+  assert.equal(!!saved.piExecution?.completedAt,outcome==='complete');assert.equal(saved.piExecution?.commentsRecordedAt,outcome==='complete'?null:undefined);assert.equal(saved.piReview,undefined);
  }finally{await service.close();store.close();}
 });
 
 test('successful Agent followed by transient discussion-read failure recovers without rerunning Agent',async()=>{
- const store=new TaskStore(':memory:'),e=entry();delete e.piExecution;e.writePending='';
+ const store=new TaskStore(':memory:'),e=entry();delete e.piExecution;e.writePending='';e.source='manual';e.notificationReceiver='owner';
  let piRuns=0,notesUnavailable=true;const writes:string[][]=[];
  const service=new GroupMrService(store,async(args,_directory,_timeout,_log,onLine)=>{
   let value:unknown={};
@@ -216,17 +229,20 @@ test('successful Agent followed by transient discussion-read failure recovers wi
   else if(args[2]==='pipeline')value=[{id:1,sha,status:'success'}];
   else {writes.push([...args]);throw Error('Unexpected write during recovery');}
   return {exitCode:0,output:JSON.stringify(value)};
- });
+ },undefined,undefined,{send:async()=>{}});
  const cfg={enabled:false,groupId:'',authorizedSender:'owner',repositoryPrefix:'MAE-M/Access/',intervalSeconds:10};
  try{
   store.putRecord('group-mr-entry',e.id,e);
   await service['executeEntry'](e,cfg,false);
   const interrupted=store.getRecord<Entry>('group-mr-entry',e.id)!;
-  assert.equal(piRuns,1);assert.equal(interrupted.writePending,'Pi 提交检视意见');assert.ok(interrupted.piExecution?.completedAt);
-  assert.equal(interrupted.phase,'ISSUES');assert.equal(interrupted.piReview,undefined);
+  assert.equal(piRuns,1);assert.equal(interrupted.writePending,'');assert.ok(interrupted.piExecution?.completedAt);assert.equal(interrupted.piExecution?.commentsRecordedAt,null);
+  assert.equal(interrupted.phase,'FAILED');assert.equal(interrupted.piReview,undefined);
   notesUnavailable=false;await service['refreshReadiness'](interrupted);
   const recovered=store.getRecord<Entry>('group-mr-entry',e.id)!;
   assert.equal(piRuns,1);assert.equal(recovered.writePending,'');assert.equal(recovered.piReview?.ok,true);
-  assert.equal(recovered.phase,'ISSUES');assert.deepEqual(writes,[]);
+  assert.equal(recovered.phase,'ISSUES');assert.ok(recovered.piExecution?.commentsRecordedAt);assert.deepEqual(writes,[]);
+  recovered.phase='HUMAN';store.putRecord('group-mr-entry',e.id,recovered);
+  await service['refreshReadiness'](recovered);
+  assert.equal(store.getRecord<Entry>('group-mr-entry',e.id)?.phase,'HUMAN');assert.equal(piRuns,1);assert.deepEqual(writes,[]);
  }finally{await service.close();store.close();}
 });
