@@ -3,10 +3,58 @@ import {strict as assert} from 'node:assert';
 import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {responseDiagnostic} from '../src/modules/automation/group-mr-diagnostics.js';
+import {codehubParameterErrorHint,responseDiagnostic} from '../src/modules/automation/group-mr-diagnostics.js';
 import {GroupMrService} from '../src/modules/automation/group-mr.js';
 import {TaskStore} from '../src/platform/store.js';
 import {FileLogs} from '../src/infrastructure/file-logs.js';
+
+test('CodeHub review errors explain the required severity without exposing CLI output',()=>{
+ const output="error: categories_and_modules_enabled is true, required: --severity. Run 'codehub-cli setting review-config' to see available values";
+ assert.equal(codehubParameterErrorHint(output),'缺少检视意见必填参数 --severity；请执行 codehub-cli setting review-config 查看仓库检视配置');
+ const hint=codehubParameterErrorHint(output+'\nAuthorization: Bearer private-token\nbody: private-review-comment');
+ assert.equal(hint,codehubParameterErrorHint(output));assert.doesNotMatch(hint!,/private-|Authorization|body/);
+});
+
+test('CodeHub review parameter hints handle only the allowed missing and invalid flags',()=>{
+ for(const flag of ['severity','review-category','review-module']){
+  for(const output of [`Error: required flag(s) "${flag}" not set`,`error: missing required parameter --${flag}`,`error: --${flag} is required`]){
+   const hint=codehubParameterErrorHint(output);assert.ok(hint,output);assert.match(hint,/缺少检视意见必填参数/);assert.ok(hint.includes('--'+flag));
+  }
+  for(const output of [`error: invalid ${flag}: private-value`,`error: invalid value "private-value" for "--${flag}": invalid choice`,`error: --${flag} must be one of private-values`]){
+   const hint=codehubParameterErrorHint(output);assert.ok(hint,output);assert.match(hint,/的值无效/);assert.ok(hint.includes('--'+flag));assert.doesNotMatch(hint,/private-/);
+  }
+ }
+ const hint=codehubParameterErrorHint('error: required: --severity, --review-category, --review-module, --private-flag.');
+ assert.ok(hint?.includes('--severity、--review-category、--review-module'));assert.doesNotMatch(hint!,/private-/);
+});
+
+test('CodeHub review parameter hints leave unrelated errors and response bodies unchanged',()=>{
+ for(const output of ['error: permission denied','error: required: --token','error: required: --severity-secret','error: invalid value for --severity-secret: private-value',JSON.stringify({body:'error: required: --severity',token:'private-token'}),'Usage: --severity is required','error: request failed: private-comment']){
+  assert.equal(codehubParameterErrorHint(output),undefined,output);
+ }
+});
+
+test('MR comment parameter failures show a safe reason, log it and never retry the write',async()=>{
+ const root=mkdtempSync(join(tmpdir(),'mr-parameter-error-')),store=new TaskStore(':memory:');let calls=0;
+ const output="error: categories_and_modules_enabled is true, required: --severity. Run 'codehub-cli setting review-config' to see available values\nAuthorization: Bearer private-token\nbody: private-review-comment login failed";
+ const service=new GroupMrService(store,async()=>{calls++;return{exitCode:1,output};},new FileLogs(root));
+ try{
+  await assert.rejects(service['command'](['codehub-cli','mr','review','create','643','--body','private-review-comment','--token','private-token']),error=>{
+   assert.ok(error instanceof Error);assert.match(error.message,/退出码 1；缺少检视意见必填参数 --severity/);assert.doesNotMatch(error.message,/private-|Bearer|login failed/);return true;
+  });
+  assert.equal(calls,1);
+  const content=readFileSync(join(root,'automation','group-mr-errors.jsonl'),'utf8');
+  assert.match(content,/缺少检视意见必填参数 --severity/);assert.doesNotMatch(content,/private-|Bearer|login failed/);
+  assert.match(content,/"parameterError":"缺少检视意见必填参数 --severity/);
+ }finally{await service.close();store.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test('successful MR command output is never treated as a parameter error',async()=>{
+ const store=new TaskStore(':memory:');const output='error: required: --severity';let calls=0;
+ const service=new GroupMrService(store,async()=>{calls++;return{exitCode:0,output};});
+ try{assert.equal(await service['command'](['codehub-cli','mr','review','create','643']),output);assert.equal(calls,1);}
+ finally{await service.close();store.close();}
+});
 
 test('MR response diagnostics keep nested shapes and statuses without credentials or contents',()=>{
  const value=responseDiagnostic(JSON.stringify({result:{discussions:[{id:17,status:'failed',body:'private comment',author:{username:'private-user'},token:'private-token',diff:'private-code'}]},resultCode:401}));

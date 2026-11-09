@@ -13,6 +13,7 @@ Flags:
   -F, --body-file string         Read body from file
       --path string              File path for line-level review
       --line lineRange           Line number in new version (N) or range (N-M)
+      --severity string          Severity (suggestion/minor/major/fatal)
   -p, --project string           Project ID or path`;
 function fixture(mode='ok'){
  const store=new TaskStore(':memory:');let resolved=false,reply='',extra=false,head=sha,views=0;
@@ -30,6 +31,7 @@ function fixture(mode='ok'){
   else if(args[3]==='list')value=notes();
   else if(args[2]==='review'){
    writes.push([...args]);
+   if(['create','reply'].includes(args[3]!)&&!args.includes('--severity'))return {exitCode:1,output:"error: categories_and_modules_enabled is true, required: --severity. Run 'codehub-cli setting review-config' to see available values"};
    if(mode==='denied')return {exitCode:1,output:'HTTP 403 Forbidden'};
    if(mode==='timeout')return {exitCode:124,output:'timeout'};
    if(args[3]==='resolve')resolved=true;
@@ -85,7 +87,28 @@ for(const action of ['resolve','reply','create'] as const)test('manual '+action+
  const f=fixture();try{const fingerprint=reviewThreads(JSON.stringify(f.notes()))[0]!.fingerprint;
  const data=action==='create'?{action,sha,operationId:randomUUID(),path:'src/a.ts',line:2,body:'Check this'}:action==='reply'?{action,sha,operationId:randomUUID(),discussionId:'thread',fingerprint,body:'Fixed now'}:{action,sha,operationId:randomUUID(),discussionId:'thread',fingerprint,confirmed:true,reason:'已核对修复'};
  await f.service.reviewWorkspaceAction(f.e.id,data);await f.service.reviewWorkspaceAction(f.e.id,data);assert.equal(f.writes.length,1);assert.equal(f.writes[0]![3],action);const saved=f.store.getRecord<Entry>('group-mr-entry',f.e.id)!;assert.equal(saved.writePending,'');assert.equal(saved.phase,'ISSUES');assert.equal(saved.manualReviewPending,undefined);assert.ok(saved.events.length>0);
+ if(action==='resolve')assert.equal(f.writes[0]!.includes('--severity'),false);else assert.equal(f.writes[0]![f.writes[0]!.indexOf('--severity')+1],'suggestion');
  }finally{await f.shutdown();}
+});
+test('manual create and reply preserve each explicitly selected severity',async()=>{
+ for(const action of ['create','reply'] as const)for(const severity of ['suggestion','minor','major','fatal']){
+  const f=fixture();try{
+   const common={action,sha,operationId:randomUUID(),body:'Original review content',severity};
+   const input=action==='create'?{...common,path:'src/a.ts',line:2}:{...common,discussionId:'thread',fingerprint:reviewThreads(JSON.stringify(f.notes()))[0]!.fingerprint};
+   await f.service.reviewWorkspaceAction(f.e.id,input);
+   assert.equal(f.writes.length,1);assert.equal(f.writes[0]![f.writes[0]!.indexOf('--severity')+1],severity);
+  }finally{await f.shutdown();}
+ }
+});
+test('invalid manual severity rejects create and reply before any write',async()=>{
+ for(const action of ['create','reply'] as const)for(const severity of ['critical','--token',null,1]){
+  const f=fixture();try{
+   const common={action,sha,operationId:randomUUID(),body:'Original review content',severity};
+   const input=action==='create'?{...common,path:'src/a.ts',line:2}:{...common,discussionId:'thread',fingerprint:reviewThreads(JSON.stringify(f.notes()))[0]!.fingerprint};
+   await assert.rejects(f.service.reviewWorkspaceAction(f.e.id,input));
+   assert.equal(f.writes.length,0);assert.equal(f.store.getRecord<Entry>('group-mr-entry',f.e.id)?.writePending,'');
+  }finally{await f.shutdown();}
+ }
 });
 for(const mode of ['timeout','accepted-timeout','denied'])test('uncertain '+mode+' is persisted, blocked from replay, and refresh is read-only',async()=>{
  const f=fixture(mode);try{const input={action:'resolve',sha,operationId:randomUUID(),discussionId:'thread',fingerprint:reviewThreads(JSON.stringify(f.notes()))[0]!.fingerprint,confirmed:true,reason:'checked'};
