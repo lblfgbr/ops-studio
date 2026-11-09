@@ -6,6 +6,7 @@ import {createHash} from 'node:crypto';
 import {stripVTControlCharacters} from 'node:util';
 import {z} from 'zod';
 import {jsonValues} from '../autout/mr-codehub.js';
+import {reviewSeverity} from './review-severity.js';
 const obj=(v:unknown):Record<string,unknown>|undefined=>v!==null&&typeof v==='object'&&!Array.isArray(v)?v as Record<string,unknown>:undefined;
 const str=(v:unknown)=>typeof v==='string'?v:typeof v==='number'?String(v):'';
 const line=(v:unknown)=>typeof v==='number'&&Number.isSafeInteger(v)&&v>0?v:null;
@@ -13,8 +14,8 @@ export const reviewSha=z.string().regex(/^[a-f0-9]{40}$/i);
 const path=z.string().min(1).max(2048).refine(v=>!/[\x00-\x1f]/.test(v));
 export const reviewAction=z.discriminatedUnion('action',[
  z.object({action:z.literal('resolve'),sha:reviewSha,operationId:z.uuid(),discussionId:z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/),fingerprint:z.string().regex(/^[a-f0-9]{64}$/),reason:z.string().trim().min(1).max(4000),confirmed:z.literal(true)}).strict(),
- z.object({action:z.literal('reply'),sha:reviewSha,operationId:z.uuid(),discussionId:z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/),fingerprint:z.string().regex(/^[a-f0-9]{64}$/),body:z.string().trim().min(1).max(10000)}).strict(),
- z.object({action:z.literal('create'),sha:reviewSha,operationId:z.uuid(),path,line:z.number().int().positive(),body:z.string().trim().min(1).max(10000)}).strict()
+ z.object({action:z.literal('reply'),sha:reviewSha,operationId:z.uuid(),discussionId:z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/),fingerprint:z.string().regex(/^[a-f0-9]{64}$/),body:z.string().trim().min(1).max(10000),severity:reviewSeverity.optional()}).strict(),
+ z.object({action:z.literal('create'),sha:reviewSha,operationId:z.uuid(),path,line:z.number().int().positive(),body:z.string().trim().min(1).max(10000),severity:reviewSeverity.optional()}).strict()
 ]);
 export interface ReviewNote {id:string;body:string;author:string;time:string;system:boolean;bot:boolean;}
 export interface ReviewThread {id:string;body:string;author:string;resolved:boolean;resolvable:boolean;path:string;oldPath:string;line:number|null;oldLine:number|null;headSha:string;outdated?:boolean;notes:ReviewNote[];fingerprint:string;}

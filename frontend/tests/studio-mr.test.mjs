@@ -153,8 +153,14 @@ test('production MR blocks stale normal merges and other writes but permits expl
         if(scenario==='sha')r.sha='b'.repeat(40);
         return new Response(JSON.stringify(data));
       }
-      if(path.endsWith('/3/workspace')&&scenario==='pipeline'){
-        const data=await response.json();data.pipelinePassed=false;data.readiness.ready=false;data.readiness.reason='当前提交流水线尚未通过';return new Response(JSON.stringify(data));
+      if(path.endsWith('/3/workspace')){
+        const data=await response.json();
+        if(scenario==='pipeline'){data.pipelinePassed=false;data.readiness.ready=false;data.readiness.reason='当前提交流水线尚未通过';}
+        // Status and workspace describe the same pending operation; otherwise
+        // the fixture continuously advertises a newer, contradictory snapshot.
+        if(scenario==='merge-pending')data.writePending='合并';
+        if(scenario==='approval-pending')data.writePending='审核';
+        return new Response(JSON.stringify(data));
       }
       return response;
     }}});t.after(s.close);

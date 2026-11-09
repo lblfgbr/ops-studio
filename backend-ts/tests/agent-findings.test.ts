@@ -14,10 +14,10 @@ function submission(f:AgentFinding=finding,status:AgentSubmission['status']='pen
 }
 function harness(){
  const store=new TaskStore(':memory:'),e=row(),writes:string[][]=[];
- const state={head:sha,notes:[] as unknown[],notesFail:false,notesReads:0,notesFailAfterCreate:false,ackLost:false,deliver:true,stripMarkers:false,failCreates:new Set<number>(),piRuns:0,findings:[finding],invalidAnswer:false,changesReads:0,changesFail:false,changes:[{new_path:finding.path,diff:'@@ -0,0 +1,2 @@\n+one\n+two'}]};
+ const state={head:sha,notes:[] as unknown[],notesFail:false,notesReads:0,notesFailAfterCreate:false,ackLost:false,deliver:true,stripMarkers:false,failCreates:new Set<number>(),piRuns:0,findings:[finding],invalidAnswer:false,answerOverride:'',changesReads:0,changesFail:false,changes:[{new_path:finding.path,diff:'@@ -0,0 +1,2 @@\n+one\n+two'}]};
  const service=new GroupMrService(store,async(args,_dir,_timeout,_log,onLine)=>{
   if(args[0]==='pi'){
-   state.piRuns++;onLine?.(JSON.stringify({type:'agent_end',messages:[{role:'assistant',stopReason:'stop',content:[{type:'text',text:state.invalidAnswer?'完成':answer(state.findings)}]}]}),false);
+   state.piRuns++;onLine?.(JSON.stringify({type:'agent_end',messages:[{role:'assistant',stopReason:'stop',content:[{type:'text',text:state.answerOverride||(state.invalidAnswer?'完成':answer(state.findings))}]}]}),false);
    return {exitCode:0,output:''};
   }
   let value:unknown={};
@@ -28,6 +28,7 @@ function harness(){
   else if(args[2]==='changes'){state.changesReads++;if(state.changesFail)throw Error('差异读取失败');value={changes:state.changes};}
   else if(args[3]==='create'){
    writes.push([...args]);
+   if(!args.includes('--severity'))return {exitCode:1,output:"error: categories_and_modules_enabled is true, required: --severity. Run 'codehub-cli setting review-config' to see available values"};
    if(state.failCreates.has(writes.length))throw Error('HTTP 400: invalid position');
    const body=args[args.indexOf('--body')+1]!;
    if(state.deliver)state.notes.push({id:'note-'+writes.length,resolved:false,notes:[{id:'body-'+writes.length,body:state.stripMarkers?body.replace(/<!-- ops-studio-[\s\S]*?-->/g,'').trim():body,author:{username:'reviewer'},position:{new_path:args[args.indexOf('--path')+1],new_line:Number(args[args.indexOf('--line')+1]),head_sha:state.head}}]});
@@ -45,6 +46,44 @@ function harness(){
 test('malformed, missing, duplicated, or wrong-SHA Agent results cannot authorize publishing',()=>{
  for(const input of ['完成',answer()+answer(),answer().replace(sha,'b'.repeat(40)),answer().replace('"findings":[]','"findings":[{"path":"x","line":0,"body":"bad"}]')])assert.throws(()=>parseAgentResult(input,sha));
  assert.deepEqual(parseAgentResult(answer(),sha).findings,[]);
+});
+
+test('Agent findings preserve explicit severity and keep legacy findings compatible',()=>{
+ assert.deepEqual(parseAgentResult(answer([finding]),sha).findings,[finding]);
+ for(const severity of ['suggestion','minor','major','fatal'] as const){
+  const expected={...finding,severity};
+  assert.deepEqual(parseAgentResult(answer([expected]),sha).findings,[expected]);
+ }
+});
+
+test('repositories requiring severity accept default and explicit Agent finding levels',async()=>{
+ const h=harness();try{
+  const levels=['suggestion','minor','major','fatal'] as const;
+  h.state.findings=[finding,...levels.map(severity=>({...finding,body:finding.body+' '+severity,severity}))];
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.deepEqual(h.writes.map(args=>args[args.indexOf('--severity')+1]),['suggestion',...levels]);
+  assert.ok(h.store.records<AgentSubmission>('group-mr-agent-submission').every(s=>s.status==='confirmed'));
+ }finally{await h.close();}
+});
+
+test('invalid Agent severity stops the whole result before any comment submission',async()=>{
+ for(const severity of ['critical','--token',null,1]){
+  const h=harness();try{
+   h.state.answerOverride='<ops-studio-review-result>'+JSON.stringify({sha,assessments:[],findings:[finding,{...finding,severity}]})+'</ops-studio-review-result>';
+   await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'),/字段/);
+   assert.equal(h.writes.length,0);assert.equal(h.store.records<AgentSubmission>('group-mr-agent-submission').length,0);
+  }finally{await h.close();}
+ }
+});
+
+test('changing only severity does not repost a confirmed legacy finding',async()=>{
+ const h=harness();try{
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  h.state.notes=[];h.state.findings=[{...finding,severity:'fatal'}];
+  assert.equal(findingIdentity(h.state.findings[0]!),findingIdentity(finding));
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.equal(h.writes.length,1);assert.equal(h.store.records<AgentSubmission>('group-mr-agent-submission').length,1);
+ }finally{await h.close();}
 });
 
 test('analysis failure creates no uncertain write; explicit retry can publish normally',async()=>{
