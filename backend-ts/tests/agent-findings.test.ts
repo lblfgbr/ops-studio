@@ -10,7 +10,7 @@ const answer=(findings:AgentFinding[]=[])=>'<ops-studio-review-result>'+JSON.str
 function row():Entry{return {id:'attempt',repo,iid:'1',url,sha,previousSha:'',messageId:'',sender:'owner',source:'manual',notificationReceiver:'owner',humanReviewRequired:true,shortcut:false,phase:'ISSUES',stage:'PI',status:'旧失败原因',detail:'',createdAt:'2026-11-03T00:00:00Z',updatedAt:'2026-11-03T00:00:00Z',writePending:'',events:[]};}
 function harness(){
  const store=new TaskStore(':memory:'),e=row(),writes:string[][]=[];
- const state={head:sha,notes:[] as unknown[],notesFail:false,ackLost:false,deliver:true,piRuns:0,findings:[finding],invalidAnswer:false};
+ const state={head:sha,notes:[] as unknown[],notesFail:false,ackLost:false,deliver:true,piRuns:0,findings:[finding],invalidAnswer:false,changesReads:0,changesFail:false,changes:[{new_path:finding.path,diff:'@@ -0,0 +1,2 @@\n+one\n+two'}]};
  const service=new GroupMrService(store,async(args,_dir,_timeout,_log,onLine)=>{
   if(args[0]==='pi'){
    state.piRuns++;onLine?.(JSON.stringify({type:'agent_end',messages:[{role:'assistant',stopReason:'stop',content:[{type:'text',text:state.invalidAnswer?'完成':answer(state.findings)}]}]}),false);
@@ -21,10 +21,10 @@ function harness(){
   if(args[1]==='user')value={username:'reviewer'};
   else if(args[2]==='view')value={iid:1,state:'opened',sha:state.head};
   else if(args[3]==='list'){if(state.notesFail)throw Error('读取失败');value=state.notes;}
-  else if(args[2]==='changes')value={changes:[{new_path:finding.path,diff:'@@ -0,0 +1,2 @@\n+one\n+two'}]};
+  else if(args[2]==='changes'){state.changesReads++;if(state.changesFail)throw Error('差异读取失败');value={changes:state.changes};}
   else if(args[3]==='create'){
    writes.push([...args]);
-   if(state.deliver)state.notes.push({id:'note-'+writes.length,resolved:false,notes:[{id:'body-'+writes.length,body:args[args.indexOf('--body')+1],author:{username:'reviewer'},position:{new_path:finding.path,new_line:Number(args[args.indexOf('--line')+1]),head_sha:state.head}}]});
+   if(state.deliver)state.notes.push({id:'note-'+writes.length,resolved:false,notes:[{id:'body-'+writes.length,body:args[args.indexOf('--body')+1],author:{username:'reviewer'},position:{new_path:args[args.indexOf('--path')+1],new_line:Number(args[args.indexOf('--line')+1]),head_sha:state.head}}]});
    if(state.ackLost)throw Error('response lost');
   }else if(args[2]==='gate')value={ci_state_passed:true};
   else if(args[2]==='pipeline')value=[{id:1,sha:state.head,status:'success'}];
@@ -77,11 +77,32 @@ test('closed remote opinion with shifted line is not posted again',async()=>{
  }finally{await h.close();}
 });
 
-for(const failure of ['read','changed-sha','invalid-line'] as const)test('no posting without a valid stable complete snapshot: '+failure,async()=>{
+test('context-line findings retain their positions and do not block other findings',async()=>{
+ const h=harness();try{
+  const path='recipes/sample.yaml';
+  h.state.changes=[{new_path:path,diff:'@@ -43,3 +52,6 @@\n+    outputs:\n+      rewritten: ${api_response}\n       output_parser:\n         show_title: true\n         show_content: true\n+    next:'}];
+  h.state.findings=[{path,line:54,body:'请确认解析器在新增节点中的归属。'},{path,line:53,body:'请确认新增输出是否需要处理空响应。'}];
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.deepEqual(h.writes.map(args=>({path:args[args.indexOf('--path')+1],line:Number(args[args.indexOf('--line')+1])})),[{path,line:54},{path,line:53}]);
+  for(const [index,args] of h.writes.entries())assert.ok(args[args.indexOf('--body')+1]?.startsWith(h.state.findings[index]!.body+'\n\n'));
+  assert.deepEqual(h.store.records<AgentSubmission>('group-mr-agent-submission').map(s=>({line:s.finding.line,status:s.status})).sort((a,b)=>a.line-b.line),[{line:53,status:'confirmed'},{line:54,status:'confirmed'}]);
+ }finally{await h.close();}
+});
+
+test('publishing Agent findings does not depend on retrieving a diff',async()=>{
+ const h=harness();try{
+  h.state.changesFail=true;h.state.findings=[{...finding,path:'src/related.ts',line:100}];
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.equal(h.state.changesReads,0);assert.equal(h.writes.length,1);
+  const args=h.writes[0]!;assert.equal(args[args.indexOf('--path')+1],'src/related.ts');assert.equal(args[args.indexOf('--line')+1],'100');
+  assert.equal(h.store.records<AgentSubmission>('group-mr-agent-submission')[0]?.status,'confirmed');
+ }finally{await h.close();}
+});
+
+for(const failure of ['read','changed-sha'] as const)test('no posting without a valid stable complete snapshot: '+failure,async()=>{
  const h=harness();try{
   if(failure==='read')h.state.notesFail=true;
   if(failure==='changed-sha')h.state.head='b'.repeat(40);
-  if(failure==='invalid-line')h.state.findings=[{...finding,line:100}];
   await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'));assert.equal(h.writes.length,0);
  }finally{await h.close();}
 });
