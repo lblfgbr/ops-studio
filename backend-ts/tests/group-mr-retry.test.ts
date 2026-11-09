@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {randomUUID} from 'node:crypto';
 import Fastify from 'fastify';
 import {GroupMrService,groupMrRoutes,type Entry} from '../src/modules/automation/group-mr.js';
+import {findingIdentity,type AgentSubmission} from '../src/modules/automation/agent-findings.js';
 import {TaskStore} from '../src/platform/store.js';
 const sha='a'.repeat(40),nextSha='b'.repeat(40);
 const deferred=()=>{let release=()=>{};const promise=new Promise<void>(resolve=>release=resolve);return {promise,release};};
@@ -61,6 +62,16 @@ for(const pending of ['合并','群消息回复','审核'])test('retry does not 
  const f=fixture();f.e.writePending=pending;f.store.putRecord('group-mr-entry',f.e.id,f.e);
  try{const accepted=f.service.retryRecord(f.e.id,{sha});await settle(f.service);const result=f.store.getRecord<Entry>('group-mr-entry',accepted.entryId)!;assert.equal(result.phase,'ISSUES');assert.equal(result.writePending,pending);assert.match(result.status,/仍待核对/);assert.equal(f.state.pi,0);assert.equal(f.calls.some(c=>c[2]==='approve'||c[2]==='merge'||c[0]==='welink-cli'),false);}finally{await f.close();}
 });
+test('retry clears a legacy individual Agent comment marker without manual confirmation',async()=>{
+ const f=fixture();f.e.writePending='Agent 单条意见提交';f.store.putRecord('group-mr-entry',f.e.id,f.e);
+ try{
+  const accepted=f.service.retryRecord(f.e.id,{sha});await settle(f.service);
+  const result=f.store.getRecord<Entry>('group-mr-entry',accepted.entryId)!;
+  assert.equal(result.phase,'HUMAN');assert.equal(result.writePending,'');assert.equal(f.state.pi,1);
+  assert.equal(f.store.getRecord<Entry>('group-mr-entry',f.e.id)?.writePending,'');
+  assert.equal(f.calls.some(c=>c[2]==='approve'||c[2]==='merge'||c[0]==='welink-cli'),false);
+ }finally{await f.close();}
+});
 test('retry reconciles a confirmed approval without replaying it',async()=>{
  const f=fixture();f.e.writePending='审核';f.state.approvalPassed=true;f.store.putRecord('group-mr-entry',f.e.id,f.e);
  try{const accepted=f.service.retryRecord(f.e.id,{sha});await settle(f.service);assert.equal(f.store.getRecord<Entry>('group-mr-entry',accepted.entryId)?.phase,'HUMAN');assert.equal(f.store.getRecord<Entry>('group-mr-entry',f.e.id)?.writePending,'');assert.equal(f.calls.some(c=>c[2]==='approve'),false);}finally{await f.close();}
@@ -96,6 +107,25 @@ test('retry reuses a confirmed review on the same SHA without another Agent invo
   const stopped=f.store.getRecord<Entry>('group-mr-entry',first.entryId)!;stopped.phase='FAILED';stopped.status='后续操作失败';f.store.putRecord('group-mr-entry',stopped.id,stopped);
   const second=f.service.retryRecord(stopped.id,{sha});await settle(f.service);
   assert.equal(f.state.pi,1);assert.equal(f.store.getRecord<Entry>('group-mr-entry',second.entryId)?.phase,'HUMAN');
+ }finally{await f.close();}
+});
+for(const status of ['failed','pending'] as const)test('same-SHA checkpoint cannot hide an Agent comment '+status+'; a fresh empty review retires it',async()=>{
+ const f=fixture();try{
+  const first=f.service.retryRecord(f.e.id,{sha});await settle(f.service);
+  const stopped=f.store.getRecord<Entry>('group-mr-entry',first.entryId)!;
+  assert.equal(f.state.pi,1);assert.ok(f.store.getRecord('group-mr-review-checkpoint',f.e.repo+':1'));
+  const finding={path:'src/example.ts',line:54,body:'请确认该问题在当前提交中是否仍然成立。'},identity=findingIdentity(finding);
+  const submission:AgentSubmission={key:f.e.repo+':1:'+identity,repo:f.e.repo,iid:'1',sha,entryId:stopped.id,author:'original',finding,marker:'<!-- ops-studio-finding:'+identity+' -->',status,error:'上一次提交未完成'};
+  f.store.putRecord('group-mr-agent-submission',submission.key,submission);
+  stopped.phase='FAILED';stopped.status='Agent 意见提交未完成';f.store.putRecord('group-mr-entry',stopped.id,stopped);
+  const second=f.service.retryRecord(stopped.id,{sha});await settle(f.service);
+  const reviewed=f.store.getRecord<Entry>('group-mr-entry',second.entryId)!;
+  assert.equal(f.state.pi,2);assert.equal(reviewed.phase,'HUMAN');assert.equal(reviewed.writePending,'');
+  assert.equal(f.store.getRecord<AgentSubmission>('group-mr-agent-submission',submission.key)?.status,'not-submitted');
+  reviewed.phase='FAILED';reviewed.status='后续操作失败';f.store.putRecord('group-mr-entry',reviewed.id,reviewed);
+  const third=f.service.retryRecord(reviewed.id,{sha});await settle(f.service);
+  assert.equal(f.state.pi,2);assert.equal(f.store.getRecord<Entry>('group-mr-entry',third.entryId)?.phase,'HUMAN');
+  assert.equal(f.calls.some(c=>c[3]==='create'),false);
  }finally{await f.close();}
 });
 test('retry preserves a group task human-review policy even when current configuration differs',async()=>{

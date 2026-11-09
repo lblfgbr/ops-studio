@@ -2,15 +2,19 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {GroupMrService,type Entry} from '../src/modules/automation/group-mr.js';
 import {TaskStore} from '../src/platform/store.js';
-import {parseAgentResult,type AgentFinding,type AgentSubmission} from '../src/modules/automation/agent-findings.js';
+import {parseAgentResult,findingIdentity,type AgentFinding,type AgentSubmission} from '../src/modules/automation/agent-findings.js';
 
 const sha='a'.repeat(40),repo='MAE-M/Access/Demo',url='https://codehub-y.huawei.com/'+repo+'/merge_requests/1';
 const finding:AgentFinding={path:'src/a.ts',line:1,body:'空值会触发异常，请确认上游是否保证非空。'};
 const answer=(findings:AgentFinding[]=[])=>'<ops-studio-review-result>'+JSON.stringify({sha,assessments:[],findings})+'</ops-studio-review-result>';
 function row():Entry{return {id:'attempt',repo,iid:'1',url,sha,previousSha:'',messageId:'',sender:'owner',source:'manual',notificationReceiver:'owner',humanReviewRequired:true,shortcut:false,phase:'ISSUES',stage:'PI',status:'旧失败原因',detail:'',createdAt:'2026-11-03T00:00:00Z',updatedAt:'2026-11-03T00:00:00Z',writePending:'',events:[]};}
+function submission(f:AgentFinding=finding,status:AgentSubmission['status']='pending'):AgentSubmission{
+ const identity=findingIdentity(f);
+ return {key:repo+':1:'+identity,repo,iid:'1',sha,entryId:'attempt',author:'reviewer',finding:f,marker:'<!-- ops-studio-finding:'+identity+' -->',status};
+}
 function harness(){
  const store=new TaskStore(':memory:'),e=row(),writes:string[][]=[];
- const state={head:sha,notes:[] as unknown[],notesFail:false,ackLost:false,deliver:true,piRuns:0,findings:[finding],invalidAnswer:false,changesReads:0,changesFail:false,changes:[{new_path:finding.path,diff:'@@ -0,0 +1,2 @@\n+one\n+two'}]};
+ const state={head:sha,notes:[] as unknown[],notesFail:false,notesReads:0,notesFailAfterCreate:false,ackLost:false,deliver:true,stripMarkers:false,failCreates:new Set<number>(),piRuns:0,findings:[finding],invalidAnswer:false,changesReads:0,changesFail:false,changes:[{new_path:finding.path,diff:'@@ -0,0 +1,2 @@\n+one\n+two'}]};
  const service=new GroupMrService(store,async(args,_dir,_timeout,_log,onLine)=>{
   if(args[0]==='pi'){
    state.piRuns++;onLine?.(JSON.stringify({type:'agent_end',messages:[{role:'assistant',stopReason:'stop',content:[{type:'text',text:state.invalidAnswer?'完成':answer(state.findings)}]}]}),false);
@@ -20,11 +24,13 @@ function harness(){
   if(args.includes('--help'))return {exitCode:0,output:`codehub-cli mr review ${args[3]} <iid>${args[3]==='reply'?' <discussion-id>':''}\n -b, --body string\n -p, --project string\n --path string\n --line lineRange`};
   if(args[1]==='user')value={username:'reviewer'};
   else if(args[2]==='view')value={iid:1,state:'opened',sha:state.head};
-  else if(args[3]==='list'){if(state.notesFail)throw Error('读取失败');value=state.notes;}
+  else if(args[3]==='list'){state.notesReads++;if(state.notesFail||state.notesFailAfterCreate&&writes.length)throw Error('读取失败');value=state.notes;}
   else if(args[2]==='changes'){state.changesReads++;if(state.changesFail)throw Error('差异读取失败');value={changes:state.changes};}
   else if(args[3]==='create'){
    writes.push([...args]);
-   if(state.deliver)state.notes.push({id:'note-'+writes.length,resolved:false,notes:[{id:'body-'+writes.length,body:args[args.indexOf('--body')+1],author:{username:'reviewer'},position:{new_path:args[args.indexOf('--path')+1],new_line:Number(args[args.indexOf('--line')+1]),head_sha:state.head}}]});
+   if(state.failCreates.has(writes.length))throw Error('HTTP 400: invalid position');
+   const body=args[args.indexOf('--body')+1]!;
+   if(state.deliver)state.notes.push({id:'note-'+writes.length,resolved:false,notes:[{id:'body-'+writes.length,body:state.stripMarkers?body.replace(/<!-- ops-studio-[\s\S]*?-->/g,'').trim():body,author:{username:'reviewer'},position:{new_path:args[args.indexOf('--path')+1],new_line:Number(args[args.indexOf('--line')+1]),head_sha:state.head}}]});
    if(state.ackLost)throw Error('response lost');
   }else if(args[2]==='gate')value={ci_state_passed:true};
   else if(args[2]==='pipeline')value=[{id:1,sha:state.head,status:'success'}];
@@ -49,24 +55,89 @@ test('analysis failure creates no uncertain write; explicit retry can publish no
  }finally{await h.close();}
 });
 
-test('lost create response is reconciled by operation marker and is never sent twice',async()=>{
+for(const remote of ['missing','stripped-markers'] as const)test('CLI success completes publishing without a matching remote marker: '+remote,async()=>{
  const h=harness();try{
-  h.state.ackLost=true;await h.service['runPi'](h.e,'',[],'reviewer');assert.equal(h.writes.length,1);
+  h.state.deliver=remote!=='missing';h.state.stripMarkers=remote==='stripped-markers';
+  await h.service['runPi'](h.e,'',[],'reviewer');assert.equal(h.writes.length,1);
   assert.equal(h.store.records<AgentSubmission>('group-mr-agent-submission')[0]?.status,'confirmed');
-  h.e.writePending='';await h.service['runPi'](h.e,'',[],'reviewer');assert.equal(h.writes.length,1);
+  assert.equal(h.e.writePending,'');assert.ok(h.e.piExecution?.completedAt);
+  await h.service['runPi'](h.e,'',[],'reviewer');assert.equal(h.writes.length,1);
  }finally{await h.close();}
 });
 
-test('pending individual write survives new analysis and changed SHA without blocking other findings',async()=>{
+test('a batch publishes every distinct finding without reading back between creates',async()=>{
  const h=harness();try{
-  h.state.deliver=false;await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'),/1 条/);assert.equal(h.writes.length,1);
-  await h.service['recoverAgentAttempts'](h.e);
-  h.state.deliver=true;h.state.findings=[{...finding,line:2}, {...finding,line:2,body:'另一处独立问题，请确认。'}];
-  await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'),/1 条/);
-  assert.equal(h.state.piRuns,2);assert.equal(h.writes.length,2);
-  await assert.rejects(h.service['verifyManualReview'](h.e,sha),/单条 Agent/);
-  h.state.head='b'.repeat(40);h.e.sha=h.state.head;
-  await assert.rejects(h.service['publishAgentFindings'](h.e,[finding],'reviewer'),/1 条/);assert.equal(h.writes.length,2);
+  h.state.notesFailAfterCreate=true;h.state.findings=[finding,{...finding,line:2,body:'另一处独立问题，请确认。'},finding];
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.equal(h.state.notesReads,1);assert.equal(h.writes.length,2);assert.equal(h.e.writePending,'');
+  assert.ok(h.store.records<AgentSubmission>('group-mr-agent-submission').every(s=>s.status==='confirmed'));
+ }finally{await h.close();}
+});
+
+test('a failed create reports its error, still publishes other findings, and can be retried by a new review',async()=>{
+ const h=harness();try{
+  h.state.findings=[finding,{...finding,line:2,body:'另一处独立问题，请确认。'}];h.state.failCreates.add(1);
+  await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'),error=>error instanceof Error&&/提交失败/.test(error.message)&&/src\/a.ts:1/.test(error.message)&&/HTTP 400/.test(error.message)&&!/待核对/.test(error.message));
+  const failed=h.store.getRecord<AgentSubmission>('group-mr-agent-submission',submission().key)!;
+  assert.equal(failed.status,'failed');assert.match(failed.error??'',/HTTP 400/);
+  assert.equal(h.store.getRecord<AgentSubmission>('group-mr-agent-submission',submission(h.state.findings[1]!).key)?.status,'confirmed');
+  assert.equal(h.writes.length,2);assert.equal(h.e.writePending,'');assert.equal(h.e.piExecution?.completedAt,undefined);
+  h.state.failCreates.clear();await h.service['recoverAgentAttempts'](h.e);
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.equal(h.writes.length,3);assert.equal(h.store.getRecord<AgentSubmission>('group-mr-agent-submission',failed.key)?.status,'confirmed');
+  assert.equal(h.e.writePending,'');assert.ok(h.e.piExecution?.completedAt);
+ }finally{await h.close();}
+});
+
+test('a lost response is reported, while the next explicit review recognizes the delivered comment without reposting',async()=>{
+ const h=harness();try{
+  h.state.ackLost=true;await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'),/response lost/);
+  assert.equal(h.writes.length,1);assert.equal(h.e.writePending,'');
+  assert.equal(h.store.records<AgentSubmission>('group-mr-agent-submission')[0]?.status,'failed');
+  h.state.ackLost=false;await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.equal(h.writes.length,1);assert.equal(h.store.records<AgentSubmission>('group-mr-agent-submission')[0]?.status,'confirmed');
+  assert.ok(h.store.getRecord('group-mr-owned-discussion',repo+':1:note-1'));
+ }finally{await h.close();}
+});
+
+for(const status of ['pending','retry-authorized'] as const)test('an explicit review can submit a legacy '+status+' finding without per-comment confirmation',async()=>{
+ const h=harness();try{
+  const operation=submission(finding,status);h.store.putRecord('group-mr-agent-submission',operation.key,operation);
+  h.e.writePending='Agent 单条意见提交';h.store.putRecord('group-mr-entry',h.e.id,h.e);
+  await h.service['recoverAgentAttempts'](h.e);assert.equal(h.writes.length,0);assert.equal(h.e.writePending,'');
+  await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.equal(h.writes.length,1);assert.equal(h.store.getRecord<AgentSubmission>('group-mr-agent-submission',operation.key)?.status,'confirmed');
+ }finally{await h.close();}
+});
+
+test('a new analysis retires failed findings that no longer apply',async()=>{
+ const h=harness();try{
+  const operation={...submission(finding,'failed'),error:'HTTP 400: invalid position'};h.store.putRecord('group-mr-agent-submission',operation.key,operation);
+  h.state.findings=[];await h.service['runPi'](h.e,'',[],'reviewer');
+  assert.equal(h.writes.length,0);assert.equal(h.store.getRecord<AgentSubmission>('group-mr-agent-submission',operation.key)?.status,'not-submitted');
+  assert.equal(h.e.writePending,'');assert.ok(h.e.piExecution?.completedAt);
+ }finally{await h.close();}
+});
+
+test('successful comments can gain ownership later without making success depend on marker readback',async()=>{
+ const h=harness();try{
+  h.state.deliver=false;await h.service['runPi'](h.e,'',[],'reviewer');
+  const operation=h.store.records<AgentSubmission>('group-mr-agent-submission')[0]!;
+  assert.equal(operation.status,'confirmed');assert.equal(operation.discussionId,undefined);
+  h.state.notes=[{id:'late-note',resolved:false,notes:[{body:finding.body+'\n\n'+operation.marker,author:{username:'reviewer'},position:{new_path:finding.path,new_line:1,head_sha:sha}}]}];
+  await h.service['refreshReadiness'](h.e);
+  assert.equal(h.store.getRecord<AgentSubmission>('group-mr-agent-submission',operation.key)?.discussionId,'late-note');
+  assert.ok(h.store.getRecord('group-mr-owned-discussion',repo+':1:late-note'));assert.equal(h.writes.length,1);
+ }finally{await h.close();}
+});
+
+test('legacy submission bookkeeping does not block review, but unresolved remote comments still do',async()=>{
+ const h=harness();try{
+  const operation=submission();h.store.putRecord('group-mr-agent-submission',operation.key,operation);
+  h.e.writePending='Agent 单条意见提交';h.store.putRecord('group-mr-entry',h.e.id,h.e);
+  await h.service['verifyManualReview'](h.e,sha);assert.equal(h.e.writePending,'');assert.equal(h.writes.length,0);
+  h.state.notes=[{id:'open',resolved:false,notes:[{body:'请处理当前问题',author:{username:'reviewer'},position:{new_path:finding.path,new_line:1,head_sha:sha}}]}];
+  await assert.rejects(h.service['verifyManualReview'](h.e,sha),/未关闭|未闭环/);assert.equal(h.writes.length,0);
  }finally{await h.close();}
 });
 
@@ -118,12 +189,13 @@ test('explicit retry reads remote before clearing legacy blocker and keeps origi
  }finally{await h.close();}
 });
 
-test('pending ledger survives service restart and hidden attempts',async()=>{
+test('restart releases a legacy submission blocker without replaying comments, including hidden attempts',async()=>{
  const h=harness();try{
-  h.state.deliver=false;await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'));
+  const operation=submission();h.store.putRecord('group-mr-agent-submission',operation.key,operation);
+  h.e.writePending='Agent 单条意见提交';h.store.putRecord('group-mr-entry',h.e.id,h.e);
   h.store.putRecord('group-mr-hidden',h.e.id,{id:h.e.id});await h.service.close();let calls=0;
   const restarted=new GroupMrService(h.store,async()=>{calls++;throw Error('no replay');});
-  try{assert.equal(calls,0);assert.equal(restarted['agentSubmissions'](h.e)[0]?.status,'pending');}
+  try{assert.equal(calls,0);assert.notEqual(restarted['agentSubmissions'](h.e)[0]?.status,'confirmed');assert.equal(h.store.getRecord<Entry>('group-mr-entry',h.e.id)?.writePending,'');}
   finally{await restarted.close();}
  }finally{await h.close();}
 });
@@ -138,15 +210,13 @@ test('review guard exposes only an argv-based read adapter, independently of the
  assert.equal(registered,'codehub_read');assert.equal(handler?.({toolName:'write',input:{}})?.block,true);
 });
 
-test('only explicit per-finding confirmation permits a later retry; confirmation itself never writes',async()=>{
+test('the legacy confirmation endpoint remains compatible and never submits a comment itself',async()=>{
  const h=harness();try{
-  h.state.deliver=false;await assert.rejects(h.service['runPi'](h.e,'',[],'reviewer'));
-  const operation=h.store.records<AgentSubmission>('group-mr-agent-submission')[0]!;
+  const operation=submission();h.store.putRecord('group-mr-agent-submission',operation.key,operation);
   await assert.rejects(h.service.confirmAgentFindingNotSubmitted(h.e.id,{sha,marker:operation.marker,confirmedNotSubmitted:false}));
   await h.service.confirmAgentFindingNotSubmitted(h.e.id,{sha,marker:operation.marker,confirmedNotSubmitted:true});
-  assert.equal(h.writes.length,1);await assert.rejects(h.service['verifyManualReview'](h.e,sha),/单条 Agent/);
-  await h.service['recoverAgentAttempts'](h.e);h.state.deliver=true;
-  await h.service['runPi'](h.e,'',[],'reviewer');assert.equal(h.writes.length,2);
+  assert.equal(h.writes.length,0);await h.service['verifyManualReview'](h.e,sha);
+  await h.service['runPi'](h.e,'',[],'reviewer');assert.equal(h.writes.length,1);
   assert.equal(h.store.records<AgentSubmission>('group-mr-agent-submission')[0]?.status,'confirmed');
  }finally{await h.close();}
 });

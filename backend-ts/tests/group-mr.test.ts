@@ -289,7 +289,7 @@ test('Pi requires a structured result and waits for a terminal RPC event',async(
    return {exitCode:0,output:''};
   });
   const entry={id:'test',repo:'MAE-M/Access/Demo',iid:'444',url:'https://codehub-y.huawei.com/MAE-M/Access/Demo/merge_requests/444',sha,previousSha:'',messageId:'1',sender:'other',shortcut:false,phase:'PI' as const,status:'',detail:'',createdAt:new Date().toISOString(),updatedAt:'',writePending:'',events:[]};
-  try{if(completed)await service['runPi'](entry,'',[]);else await assert.rejects(service['runPi'](entry,'',[]),/未正常结束/);assert.equal(entry.writePending,completed?'Pi 提交检视意见':'');assert.equal(service.list()[0]?.piOutput,'检视完成，已提交意见。');}
+  try{if(completed)await service['runPi'](entry,'',[]);else await assert.rejects(service['runPi'](entry,'',[]),/未正常结束/);assert.equal(entry.writePending,'');assert.equal(!!service.list()[0]?.piExecution?.completedAt,completed);assert.equal(service.list()[0]?.piOutput,'检视完成，已提交意见。');}
   finally{await service.close();store.close();}
  }
 });
@@ -462,8 +462,8 @@ for(const state of ['open','empty','query-error'] as const)test('natural Pi repl
   return {exitCode:0,output:JSON.stringify(value)};
  });
  try{await service['accept']({id:'1',sender:'developer',content:'https://codehub-y.huawei.com/MAE-M/Access/Demo/merge_requests/1',quoteId:''},{enabled:true,groupId:'123456789',authorizedSender:'owner',repositoryPrefix:'MAE-M/Access/',intervalSeconds:5});
- const row=service.list()[0]!;assert.equal(piRuns,1);assert.deepEqual(writes,[]);assert.equal(row.phase,state==='open'?'ISSUES':state==='empty'?'PIPELINE':'ISSUES');assert.equal(row.writePending,state==='query-error'?'Pi 提交检视意见':'');if(state==='query-error')assert.equal(service.summary().metrics.issues,0);assert.equal(row.piOutput,'检视完成，没有问题。');
- if(state==='query-error'){const before=piRuns;service.acknowledgePi(row.id);assert.equal(piRuns,before);assert.equal(service.list()[0]?.writePending,'');}
+ const row=service.list()[0]!;assert.equal(piRuns,1);assert.deepEqual(writes,[]);assert.equal(row.phase,state==='open'?'ISSUES':state==='empty'?'PIPELINE':'FAILED');assert.equal(row.writePending,'');if(state==='query-error')assert.equal(service.summary().metrics.issues,0);assert.equal(row.piOutput,'检视完成，没有问题。');
+ if(state==='query-error'){assert.ok(row.piExecution?.completedAt);assert.match(row.status,/CodeHub.*不完整/);}
  }finally{await service.close();store.close();}
 });
 
