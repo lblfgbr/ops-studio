@@ -24,15 +24,15 @@ function fixture(mode:string){
  store.putRecord('group-mr-config','main',cfg);
  const e=entry();store.putRecord('group-mr-entry',e.id,e);return {store,service,e,writes};
 }
-for(const mode of ['success','changed','closed','already-merged','pipeline','quality','conflict','comments','gate','denied','uncertain'])test('manual merge reuses remote gates and never retries a write: '+mode,async()=>{
+for(const mode of ['success','changed','closed','already-merged','pipeline','quality','conflict','comments','gate','denied','uncertain'])test('manual merge reuses remote gates and never automatically retries a write: '+mode,async()=>{
  const {store,service,e,writes}=fixture(mode);
  try{
   const result=await service.mergeRecord(e.id,{sha,confirmed:true});
   assert.equal(writes.length,['success','denied','uncertain'].includes(mode)?1:0);
   if(['success','already-merged'].includes(mode))assert.equal(result.phase,'DONE');else if(mode==='closed')assert.equal(result.phase,'CLOSED');else assert.notEqual(result.phase,'DONE');
   if(writes.length)assert.ok(writes[0]!.includes('-y'));
-  if(['success','already-merged','closed','uncertain'].includes(mode)){await assert.rejects(service.mergeRecord(e.id,{sha,confirmed:true}));assert.equal(writes.length,['success','denied','uncertain'].includes(mode)?1:0);}
-  if(mode==='uncertain')assert.equal(result.writePending,'合并');
+  if(['success','already-merged','closed'].includes(mode)){await assert.rejects(service.mergeRecord(e.id,{sha,confirmed:true}));assert.equal(writes.length,mode==='success'?1:0);}
+  if(mode==='uncertain'){assert.equal(result.writePending,'合并');const retried=await service.mergeRecord(e.id,{sha,confirmed:true});assert.equal(retried.writePending,'合并');assert.equal(writes.length,2);}
  }finally{await service.close();store.close();}
 });
 for(const mode of ['human','rejected','stale-human','pending-write','superseded','hidden','wrong-sha','unconfirmed'])test('manual merge rejects unsafe or stale selections before execution: '+mode,async()=>{
