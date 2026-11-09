@@ -299,10 +299,10 @@ export class GroupMrService {
    this.stateJobs.set(key,job);void job.then(()=>this.stateJobs.delete(key));
   }
  }
- private archiveRemote(e:Entry,remote:MrView){
+ private archiveRemote(e:Entry,remote:MrView,mergeSha?:string){
   if(remote.state!=='merged'&&remote.state!=='closed')return false;
   e.sha=this.head(remote)||e.sha;
-  if(remote.state==='merged'&&e.writePending==='合并'){e.writePending='';for(const old of this.list().filter(r=>r.id!==e.id&&r.repo===e.repo&&r.iid===e.iid&&r.writePending==='合并')){old.writePending='';this.store.putRecord('group-mr-entry',old.id,old,old.createdAt);}}
+  if(remote.state==='merged'&&e.writePending==='合并'){e.writePending='';for(const old of this.list().filter(r=>r.id!==e.id&&r.repo===e.repo&&r.iid===e.iid&&r.writePending==='合并'&&(mergeSha===undefined||r.sha===mergeSha))){old.writePending='';this.store.putRecord('group-mr-entry',old.id,old,old.createdAt);}}
   this.mark(e,remote.state==='merged'?'DONE':'CLOSED',remote.state==='merged'?'已确认远端 MR 已合入':'已确认远端 MR 已关闭');return true;
  }
 
@@ -558,11 +558,9 @@ export class GroupMrService {
  async mergeRecord(id:string,value:unknown){
   const input=z.object({sha:z.string().regex(/^[a-f0-9]{40}$/i),confirmed:z.literal(true)}).strict().parse(value),e=this.editable(id);
   if(e.supersededBy||this.store.getRecord('group-mr-hidden',id))throw Object.assign(Error('本记录已被替代或删除，请刷新'),{statusCode:409});
-  if(!['PIPELINE','ISSUES','NO_PERMISSION','INTERRUPTED','REVIEW','APPROVE','MERGE'].includes(e.phase)||(e.writePending&&!this.agentPending(e))||e.sha!==input.sha)throw Object.assign(Error('当前记录不可合入、提交已变化或有待核对操作，请刷新并核对'),{statusCode:409});
-  if(!e.shortcut){
-   if(e.humanReviewRequired!==false&&(e.humanReview?.sha!==input.sha||e.humanReview.decision!=='pass'))throw Object.assign(Error('请先完成当前提交的人工审核'),{statusCode:409});
-   if((e.piReview?.source!=='codehub'||e.piReview.sha!==input.sha||e.piReview.ok!==true||e.piReview.findings?.length)&&(e.humanReview?.sha!==input.sha||e.humanReview.decision!=='pass'))throw Object.assign(Error('当前提交尚无通过的 Agent 检视结果，请先完成检视'),{statusCode:409});
-  }
+  if(!['PIPELINE','ISSUES','NO_PERMISSION','INTERRUPTED','REVIEW','APPROVE','MERGE',...(e.writePending==='合并'?['FAILED']:[])].includes(e.phase)||(e.writePending&&e.writePending!=='合并'&&!this.agentPending(e))||e.sha!==input.sha)throw Object.assign(Error('当前记录不可合入、提交已变化或有待核对操作，请刷新并核对'),{statusCode:409});
+  if(e.writePending==='合并')return this.retryMergeRecord(e,input.sha);
+  this.requireMergeReview(e,input.sha);
   const cfg=this.configuration();
   intervention(this.store,id,'manual-merge');
   await this.enqueue(e,async()=>{
@@ -574,6 +572,65 @@ export class GroupMrService {
    await this.executeEntry(e,cfg,false);
   },true,'manual');
   return this.store.getRecord<Entry>('group-mr-entry',id)!;
+ }
+ private requireMergeReview(e:Entry,sha:string){
+  if(!e.shortcut){
+   if(e.humanReviewRequired!==false&&(e.humanReview?.sha!==sha||e.humanReview.decision!=='pass'))throw Object.assign(Error('请先完成当前提交的人工审核'),{statusCode:409});
+   if((e.piReview?.source!=='codehub'||e.piReview.sha!==sha||e.piReview.ok!==true||e.piReview.findings?.length)&&(e.humanReview?.sha!==sha||e.humanReview.decision!=='pass'))throw Object.assign(Error('当前提交尚无通过的 Agent 检视结果，请先完成检视'),{statusCode:409});
+  }
+ }
+ private restoreMergeReview(e:Entry){
+  // Legacy blocked records copied the merge marker but lost the completed review.
+  // Walk only this attempt's same-commit ancestry, never borrow another MR's approval.
+  const inherited=!e.humanReview&&!e.piReview;
+  const rows=this.list().filter(r=>r.repo===e.repo&&r.iid===e.iid&&r.sha===e.sha),history=[e],seen=new Set([e.id]);
+  for(let i=0;i<history.length;i++)for(const previous of rows){if(!seen.has(previous.id)&&previous.supersededBy===history[i]!.id){seen.add(previous.id);history.push(previous);}}
+  const reviews=history.flatMap(r=>r.humanReview?.sha===e.sha?[r.humanReview]:[]).sort((a,b)=>b.time.localeCompare(a.time));
+  const latest=reviews[0];
+  if(latest&&(!e.humanReview||e.humanReview.sha===e.sha&&latest.time>e.humanReview.time))e.humanReview=structuredClone(latest);
+  if(!e.piReview){const prior=history.find(r=>r.piReview?.sha===e.sha);if(prior?.piReview)e.piReview=structuredClone(prior.piReview);}
+  // Preserve the policy of the original attempt rather than today's group settings.
+  const original=history.slice(1).find(r=>r.writePending==='合并'&&(r.humanReview?.sha===e.sha||r.piReview?.sha===e.sha||r.shortcut));
+  if(inherited&&original){e.humanReviewRequired=original.humanReviewRequired!==false;e.reviewSkipped=original.reviewSkipped===true;if(original.shortcut)e.shortcut=true;}
+  this.save(e);
+ }
+ private clearMergeAttempt(e:Entry,sha:string){
+  for(const old of this.list().filter(r=>r.repo===e.repo&&r.iid===e.iid&&r.sha===sha&&r.writePending==='合并')){
+   old.writePending='';this.store.putRecord('group-mr-entry',old.id,old,old.createdAt);
+  }
+  e.writePending='';
+ }
+ private async retryMergeRecord(e:Entry,sha:string){
+  intervention(this.store,e.id,'retry-merge');
+  await this.enqueue(e,async()=>{
+   try{
+    const remote=await this.view(e);if(remote.state==='closed')this.clearMergeAttempt(e,sha);if(this.archiveRemote(e,remote,sha))return;
+    if(remote.state!=='opened')throw Error('MR 当前状态不可合入');
+    const head=reviewSha.parse(this.head(remote));
+    if(head!==sha){
+     this.clearMergeAttempt(e,sha);delete e.humanReview;delete e.piReview;delete e.readiness;e.pipelinePassed=false;e.pipelineWaiting=false;e.stage='PI';e.detail='';
+     this.mark(e,'ISSUES','MR 提交已变化，旧合并请求已结束；请点击重新执行检视最新提交');return;
+    }
+    this.restoreMergeReview(e);
+    if(e.humanReview?.sha===sha&&e.humanReview.decision==='reject')throw Error('当前提交的人工审核未通过，请先完成审核');
+    this.requireMergeReview(e,sha);
+    await this.verifyManualReview(e,sha);
+    const snapshot=await this.current(e,sha,false,true);
+    if(snapshot.gate.approval_reviewers_required_passed!==true&&!e.reviewSkipped)throw Error('CodeHub 检视门禁尚未通过，请处理后重新合入');
+    if(snapshot.gate.approval_approvers_required_passed!==true||snapshot.gate.merge_gate_passed!==true)throw Error('CodeHub 审核或合并门禁尚未通过，请处理后重新合入');
+    e.manualGateRequired=true;e.pipelineWaiting=false;e.detail='';this.mark(e,'MERGE','重新合入：当前提交和门禁已通过，正在提交合并');
+    // A user click authorizes one attempt. Keep the durable marker until the result is known.
+    await this.code(['mr','merge',e.iid,'-p',e.repo,'-y']);
+    const merged=await this.view(e);
+    if(merged.state!=='merged'||this.head(merged)!==sha)throw Error('合并结果尚未返回成功；可重新合入，平台会先读取远端状态');
+    this.archiveRemote(e,merged,sha);await this.replyMerged(e,this.configuration());
+   }catch(error){
+    const reason=error instanceof Error?error.message:'重新合入未完成';this.errorLog('merge-retry',reason,error);
+    if(e.phase==='DONE'||e.phase==='CLOSED'){e.detail=reason;this.save(e);}
+    else{e.detail='';this.mark(e,this.closing?'INTERRUPTED':'ISSUES','重新合入未完成：'+reason);}
+   }finally{await this.notifyManualOutcome(e);}
+  },true,'manual');
+  return this.store.getRecord<Entry>('group-mr-entry',e.id)!;
  }
 
  private validateHumanReview(e:Entry,input:z.infer<typeof reviewInput>){

@@ -141,14 +141,15 @@ test('production MR unconfirmed review does not claim approval or automatically 
   await s.wait(450);assert.equal(attempts,1);assert.equal(writes(s,'/merge').length,0);assert.deepEqual(s.errors,[]);
 });
 
-test('production MR direct merge remains disabled when current readiness, writes or SHA are unsafe',async t=>{
-  for(const scenario of ['pipeline','writePending','sha']){
+test('production MR blocks stale normal merges and other writes but permits explicit merge recovery',async t=>{
+  for(const scenario of ['pipeline','merge-pending','approval-pending','sha']){
     const s=await createStudio({route:'automation/group-mr',beforeParse(w){const fetch=w.fetch;w.fetch=async(url,options={})=>{
       const response=await fetch(url,options);const path=String(url);
       if(['/api/automation/group-mr','/api/automation/group-mr/status'].includes(path)){
         const data=await response.json(),r=data.pending.find(r=>r.id==='3');
         if(scenario==='pipeline'){r.pipelinePassed=false;r.readiness.ready=false;r.readiness.reason='当前提交流水线尚未通过';}
-        if(scenario==='writePending')r.writePending='合并';
+        if(scenario==='merge-pending')r.writePending='合并';
+        if(scenario==='approval-pending')r.writePending='审核';
         if(scenario==='sha')r.sha='b'.repeat(40);
         return new Response(JSON.stringify(data));
       }
@@ -157,9 +158,12 @@ test('production MR direct merge remains disabled when current readiness, writes
       }
       return response;
     }}});t.after(s.close);
-    assert.equal(s.d.querySelector('[data-group-mr-record="3"] [data-group-mr-action="merge"]:not(:disabled)'),null,scenario);
+    const listMerge=s.d.querySelector('[data-group-mr-record="3"] [data-group-mr-action="merge"]:not(:disabled)');
+    if(scenario==='merge-pending'){assert.ok(listMerge);assert.equal(listMerge.textContent,'重新合入');}else assert.equal(listMerge,null,scenario);
     await s.click('.nav-enter[data-mr-open="3"]');
-    assert.equal(s.d.querySelector('.nav-review-top [data-group-mr-action]:not(:disabled)'),null,scenario);
+    const detailAction=s.d.querySelector('.nav-review-top [data-group-mr-action]:not(:disabled)');
+    if(scenario==='merge-pending'){assert.ok(detailAction);assert.equal(detailAction.dataset.groupMrAction,'merge');assert.equal(detailAction.textContent,'重新合入');assert.equal(s.w.eval('mrSelected().writePending'),'合并');}
+    else assert.equal(detailAction,null,scenario);
     assert.equal(s.requests.filter(r=>r.method!=='GET').length,0);assert.deepEqual(s.errors,[]);
     s.close();
   }

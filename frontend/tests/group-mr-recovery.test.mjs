@@ -74,13 +74,15 @@ test('active Agent review retains its progress and never presents interruption o
 })
 
 
-test('workspace refresh cannot clear an unrelated uncertain write reported by the MR record',async t=>{
+for(const pending of ['合并','审核'])test('workspace refresh preserves the '+pending+' marker and only merge permits explicit recovery',async t=>{
  const {dom,d,record,writes}=await setup(t)
- record.writePending='合并';record.workspaceWritePending=''
+ record.writePending=pending;record.workspaceWritePending=''
  await dom.window.eval('loadGroupMr()')
  await dom.window.eval('mrLoad("restart")')
- assert.equal(dom.window.eval('mrSelected().writePending'),'合并')
- assert.match(dom.window.eval('groupMrActionReason(mrSelected(),"merge")'),/核对/)
+ assert.equal(dom.window.eval('mrSelected().writePending'),pending)
+ const reason=dom.window.eval('groupMrActionReason(mrSelected(),"merge")')
+ if(pending==='合并'){assert.equal(reason,'');const button=d.querySelector('.nav-review-top [data-group-mr-action="merge"]');assert.equal(button.textContent,'重新合入');assert.equal(button.disabled,false)}
+ else assert.match(reason,/核对/)
  assert.equal(d.querySelector('[data-mrw-resolve="note"]').disabled,true)
  assert.equal(writes.length,0)
 })

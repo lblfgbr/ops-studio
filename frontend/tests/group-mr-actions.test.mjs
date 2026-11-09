@@ -58,10 +58,10 @@ test('单条一键审核立即提交，进行中防重复，详情保留通过�
  d.querySelector('[data-mrw-focus]').click();for(let i=0;i<20&&!d.querySelector('.nav-list');i++)await flush();
  const button=d.querySelector('[data-group-mr-action="review"][data-record-id="1"]');assert.equal(button.textContent,'一键审核');button.click();button.click();void dom.window.eval('submitGroupMrAction()');assert.equal(calls.length,1);assert.deepEqual(calls[0].data,{sha,decision:'pass',reason:'',category:''});assert.equal(d.querySelector('.mr-action-overlay'),null);assert.match(d.querySelector('[data-mr-review-feedback]').textContent,/提交中|正在提交/);assert.equal(d.querySelector('[data-group-mr-action="review"][data-record-id="1"]').disabled,true);release();await flush();assert.equal(d.querySelector('.mr-action-overlay'),null);assert.match(d.querySelector('[data-mr-review-feedback]').textContent,/已提交|已受理/)
 })
-test('批量合入明确确认、跳过未审核项、逐项结果与历史跳转',async t=>{
+test('批量合入明确确认、跳过未审核项，失败返回待处理且成功项仍可查看历史',async t=>{
  const {d,calls}=await setup(t);select(d,'1','3','4');d.querySelector('[data-group-mr-action="merge"]:not([data-record-id])').click();assert.equal(calls.length,0);assert.match(d.querySelector('.mr-panel-count').textContent,/可合入 2 条/)
  d.querySelector('[data-mr-panel-submit]').click();await flush();assert.equal(calls.length,2);assert.deepEqual(calls.map(c=>c.url.split('/').at(-2)),['3','4']);for(const c of calls)assert.deepEqual(c.data,{sha,confirmed:true})
- assert.match(d.querySelector('.mr-complete-message').textContent,/1 条已合入，1 条未完成/);assert.match(d.querySelector('.mr-targets').textContent,/无合并权限/);d.querySelector('[data-mr-panel-results]').click();assert.equal(d.querySelector('.mr-action-overlay'),null);assert.ok(d.querySelector('[data-group-mr-record="3"]'))
+ assert.match(d.querySelector('.mr-complete-message').textContent,/1 条已合入，1 条未完成/);assert.match(d.querySelector('.mr-targets').textContent,/无合并权限/);assert.equal(d.querySelector('[data-mr-panel-results]').textContent,'返回待处理');d.querySelector('[data-mr-panel-results]').click();assert.equal(d.querySelector('.mr-action-overlay'),null);assert.equal(d.querySelector('[data-group-mr-tab="pending"]').getAttribute('aria-pressed'),'true');assert.ok(d.querySelector('[data-group-mr-record="4"]'));assert.equal(d.querySelector('[data-group-mr-record="3"]'),null);d.querySelector('[data-group-mr-tab="history"]').click();assert.ok(d.querySelector('[data-group-mr-record="3"]'))
 })
 
 test('MR 独立检视保留列表字段，处理记录滚动经刷新保留，切换 MR 不串位',async t=>{
