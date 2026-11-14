@@ -868,9 +868,9 @@ test('RPC failed assistant remains failed after settling; retries can recover',(
 });
 
 test('RPC prompt rejection is diagnostic failure, never a successful review',()=>{
- const stream=piReplyStream();stream.line(JSON.stringify({type:'response',command:'prompt',success:false,error:'private error'}));
+ const stream=piReplyStream();stream.line(JSON.stringify({type:'response',command:'prompt',success:false,error:'HTTP 401: Authorization: Bearer private-error-token'}));
  assert.equal(stream.failed(),true);assert.equal(stream.completed(),false);assert.equal(stream.diagnostic().failureKind,'prompt-rejected');
- assert.doesNotMatch(JSON.stringify(stream.diagnostic()),/private error/);
+ assert.match(stream.errorDetail()??'',/HTTP 401/);assert.doesNotMatch(JSON.stringify(stream.diagnostic()),/private-error-token/);
  for(let i=0;i<100;i++)stream.line(JSON.stringify({type:'extension_ui_request'}));
  assert.equal(stream.diagnostic().recentEvents.length,24);
 });

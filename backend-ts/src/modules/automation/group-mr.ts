@@ -1,4 +1,5 @@
 import {fileURLToPath} from 'node:url';
+import {stripVTControlCharacters} from 'node:util';
 import {parseAgentResult,findingIdentity,type AgentFinding,type AgentSubmission} from './agent-findings.js';
 import {ReviewFileError,reviewAction,reviewSha,reviewThreads,reviewFiles,reviewFileRequest,reviewFileText,fullReviewDiff,recoveredReviewDiff,addedLines,supportsReviewCommand,type ReviewThread,type ReviewCapabilities,type ReviewWorkspace,type ReviewReadiness} from './group-mr-workbench.js';
 import {discussionFingerprint,ownsDiscussion,developerReplied,type ClosureDiscussion,type OwnedDiscussion,type ReviewAssessment} from './review-closure.js';
@@ -9,6 +10,7 @@ import {ReviewKnowledge,reviewInput,type HumanReview} from './review-knowledge.j
 import {WelinkSettings} from '../autout/welink-settings.js';
 import {WelinkMcp} from '../autout/welink-mcp.js';
 import {responseDiagnostic,codehubParameterErrorHint} from './group-mr-diagnostics.js';
+import {piErrorSummary} from './pi-error-diagnostics.js';
 import {CodehubSettings} from '../autout/codehub-settings.js';
 import {randomUUID,createHash} from 'node:crypto';
 import type {FastifyInstance} from 'fastify';
@@ -77,27 +79,50 @@ export function parseDiscussions(output:string):Discussion[]{
  return reviewThreads(output).filter(n=>n.resolvable).map(n=>({id:n.id,body:n.body,author:n.author,resolved:n.resolved,replies:n.notes.slice(1).map(note=>({id:note.id,body:note.body,author:note.author,system:note.system,bot:note.bot}))}));
 }
 
+interface PiRetryDiagnostic {type:'auto_retry_start'|'auto_retry_end';attempt?:number;maxAttempts?:number;delayMs?:number;success?:boolean;error?:string;}
 export function piReplyStream(){
  let answer='',failed=false,completed=false,completionEvent='',failureKind='',stopReason='',parseErrors=0,stderrLines=0;
+ let errorMessage:string|undefined,retryError:string|undefined,lastAgentWillRetry:boolean|null=null,retryCount=0;
+ const retryEvents:PiRetryDiagnostic[]=[],stderrErrors:string[]=[];
  const events:string[]=[];
  const knownEvents=new Set(['message_start','message_update','message_end','agent_start','agent_end','agent_settled','response','extension_ui_request','tool_execution_start','tool_execution_end','auto_retry_start','auto_retry_end']);
  const take=(value:unknown)=>{const message=object(value);if(message?.role!=='assistant')return;const parts=Array.isArray(message.content)?message.content:[];answer=parts.map(object).filter(p=>p?.type==='text').map(p=>string(p?.text)).join('\n');
   const reason=string(message.stopReason);stopReason=['stop','length','toolUse','error','aborted'].includes(reason)?reason:'unknown';
-  if(['error','aborted'].includes(reason)){failed=true;failureKind='assistant-'+reason;}
+  if(['error','aborted'].includes(reason)){failed=true;failureKind='assistant-'+reason;errorMessage=piErrorSummary(message.errorMessage)??piErrorSummary(message.error)??errorMessage;}
+  else if(!failed){errorMessage=undefined;retryError=undefined;stderrErrors.length=0;}
  };
- return {answer:()=>answer,failed:()=>failed,completed:()=>completed,
-  diagnostic:()=>({completed,completionEvent,failed,failureKind,stopReason,parseErrors,stderrLines,recentEvents:[...events]}),
+ return {answer:()=>answer,failed:()=>failed,completed:()=>completed,errorDetail:()=>errorMessage??retryError??stderrErrors.at(-1),
+  diagnostic:()=>({completed,completionEvent,failed,failureKind,stopReason,parseErrors,stderrLines,errorMessage,lastAgentWillRetry,retryCount,retryEvents:[...retryEvents],stderrErrors:[...stderrErrors],recentEvents:[...events]}),
   line:(line:string,stderr=false)=>{
-   if(stderr){stderrLines++;return false;}
+   if(stderr){
+    stderrLines++;
+    const text=stripVTControlCharacters(line.slice(0,16000));
+    // Ordinary stderr can contain tool output or source text; retain only error headers.
+    if((!completed||failed)&&/^\s*(?:\[[^\]\r\n]{1,80}\]\s*)?(?:[A-Za-z]*Error:|error\b|fatal\b|exception\b|HTTP\s+[45]\d{2}\b|E(?:CONNRESET|CONNREFUSED|NOTFOUND|TIMEDOUT|AI_AGAIN)\b|错误[:：]|失败[:：])/i.test(text)){
+     const summary=piErrorSummary(line);if(summary){stderrErrors.push(summary);if(stderrErrors.length>3)stderrErrors.shift();}
+    }
+    return false;
+   }
    let event:Record<string,unknown>|undefined;
    try{event=object(JSON.parse(line));}catch{parseErrors++;return false;}
    const type=string(event?.type);events.push(knownEvents.has(type)?type:'unknown');if(events.length>24)events.shift();
+   // Trailing retry metadata is useful evidence, but cannot change a terminal outcome.
+   if(type==='auto_retry_start'||type==='auto_retry_end'){
+    const retry:PiRetryDiagnostic={type};
+    for(const key of ['attempt','maxAttempts','delayMs'] as const){const value=event?.[key];if(typeof value==='number'&&Number.isSafeInteger(value)&&value>=0)retry[key]=value;}
+    if(typeof event?.success==='boolean')retry.success=event.success;
+    const summary=piErrorSummary(event?.errorMessage)??piErrorSummary(event?.lastError)??piErrorSummary(event?.error);if(summary)retry.error=summary;
+    if(type==='auto_retry_start')retryCount++;
+    if((!completed||failed)&&event?.success!==true)retryError=summary??retryError;
+    retryEvents.push(retry);if(retryEvents.length>6)retryEvents.shift();
+   }
    // Completion is terminal for this invocation. Trailing UI/status events must not erase it.
    if(completed)return false;
-   if(type==='message_start'&&object(event?.message)?.role==='assistant'){answer='';failed=false;failureKind='';stopReason='';}
+   if(type==='message_start'&&object(event?.message)?.role==='assistant'){answer='';failed=false;failureKind='';stopReason='';errorMessage=undefined;retryError=undefined;stderrErrors.length=0;}
    if(type==='message_update'){const part=object(event?.assistantMessageEvent);if(part?.type==='text_delta')answer+=string(part.delta);}
    if(type==='message_end')take(event?.message);
-   if(type==='response'&&event?.command==='prompt'&&event.success===false){failed=true;failureKind='prompt-rejected';}
+   if(type==='response'&&event?.command==='prompt'&&event.success===false){failed=true;failureKind='prompt-rejected';errorMessage=piErrorSummary(event.errorMessage)??piErrorSummary(event.error)??errorMessage;}
+   if(type==='agent_end')lastAgentWillRetry=typeof event?.willRetry==='boolean'?event.willRetry:null;
    if(type==='agent_end'&&!event?.willRetry&&Array.isArray(event?.messages)){const last=[...event.messages].reverse().find(m=>object(m)?.role==='assistant');if(last)take(last);}
    if(type==='agent_settled'||type==='agent_end'&&!event?.willRetry){completed=true;completionEvent=type;return true;}
    return false;
@@ -1039,7 +1064,7 @@ ${scope}
   const answer=stream.answer();delete e.reviewAssessment;e.piOutput=answer.replace(/<ops-studio-review-result>[\s\S]*?<\/ops-studio-review-result>/g,'').trim().slice(0,12000);this.save(e);
   this.diagnostic={...this.diagnostic,elapsedMs:Date.now()-startedAt,exitCode:result.exitCode,answerBytes:Buffer.byteLength(answer),terminationReason:result.terminationReason??'unknown',rpc:stream.diagnostic(),response:responseDiagnostic(result.output)};
   this.recordLog(result.exitCode===0&&stream.completed()&&!stream.failed()?'info':'error',result.exitCode===0&&stream.completed()&&!stream.failed()?'Agent 执行结束，待查询 CodeHub 意见':'Agent 检视未完成');
-  if(result.exitCode!==0||stream.failed()||!stream.completed()){const reason=result.exitCode!==0?`进程退出码 ${result.exitCode}`:stream.failed()?`Agent 返回失败（${stream.diagnostic().failureKind}）`:'未收到有效完成事件';throw Error(`Agent 检视未正常结束：${reason}；本轮未提交新意见，可重新检视`);}
+  if(result.exitCode!==0||stream.failed()||!stream.completed()){const reason=result.exitCode!==0?`进程退出码 ${result.exitCode}`:stream.failed()?`Agent 返回失败（${stream.diagnostic().failureKind}）`:'未收到有效完成事件',detail=stream.errorDetail();throw Error(`Agent 检视未正常结束：${reason}${detail?'；Pi 错误：'+detail:'；Pi 未提供可用错误详情，请查看 group-mr-errors.jsonl'}；本轮未提交新意见，可重新检视`);}
   const resultData=parseAgentResult(answer,e.sha);
   e.reviewAssessment={sha:resultData.sha,assessments:resultData.assessments};this.save(e);
   await this.publishAgentFindings(e,resultData.findings,author);
