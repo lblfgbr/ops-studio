@@ -51,9 +51,17 @@ test('pending submit blocks duplicate posts; failed response retains input and n
  await s.w.eval('loadGroupMr()');await flush();assert.equal(s.writes.length,1);assert.deepEqual(s.errors,[]);
 });
 
+test('manual MR accepts a copied diffs tab URL and submits it once',async t=>{
+ const s=await fixture(t),copied=url+'/diffs/?diff_id=42#note_123';
+ input(s,copied);submit(s);submit(s);await flush();
+ assert.deepEqual(s.writes,[{path:'/api/automation/group-mr/submit',body:{url:copied}}]);
+ assert.equal(s.d.querySelector('[data-mr-review-id]').dataset.mrReviewId,'manual-1');
+ assert.deepEqual(s.errors,[]);
+});
+
 test('manual form rejects unrelated domains, multiple URLs and invalid repository paths before creating tasks',async t=>{
  const s=await fixture(t);
- for(const value of ['https://example.com/a/b/merge_requests/1',url+' '+url,'https://codehub-y.huawei.com/a/../b/merge_requests/1','https://codehub-y.huawei.com/a//b/merge_requests/1','https://codehub-y.huawei.com/a/b/merge_requests/0']){
+ for(const value of ['https://example.com/a/b/merge_requests/1',url+' '+url,'https://codehub-y.huawei.com/a/../b/merge_requests/1','https://codehub-y.huawei.com/a//b/merge_requests/1','https://codehub-y.huawei.com/a/b/merge_requests/0',url+'/diffs-extra',url+'/diffs/other',url+'/files']){
   input(s,value);submit(s);await flush();assert.match(s.d.querySelector('#manual-mr-error').textContent,/完整的 CodeHub MR 链接/);
  }
  assert.equal(s.writes.length,0);assert.deepEqual(s.errors,[]);

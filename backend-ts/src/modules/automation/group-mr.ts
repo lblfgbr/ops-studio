@@ -35,7 +35,8 @@ type Discussion=ClosureDiscussion;
 interface Monitor {state:'waiting'|'polling'|'processing'|'error';at:string;lastSuccessAt:string;error:string;readCount:number;newCount:number;matchedCount:number;filteredCount:number;message:string}
 interface MonitorEvent {time:string;level:'info'|'error';message:string}
 const monitorDefaults:Monitor={state:'waiting',at:'',lastSuccessAt:'',error:'',readCount:0,newCount:0,matchedCount:0,filteredCount:0,message:'等待首次轮询'};
-const urlPattern=/https:\/\/codehub-y\.huawei\.com\/([A-Za-z0-9._/-]+)\/merge_requests\/(\d+)(?![\w/])/g;
+// Only the MR page and its diffs tab identify a review; do not match a prefix of another subpath.
+const urlPattern=/https:\/\/codehub-y\.huawei\.com\/([A-Za-z0-9._/-]+)\/merge_requests\/(\d+)(?:\/diffs)?\/?(?=$|[?#\s<>"'()[\]，。；、！？：]|[.,;!](?=$|\s))/g;
 interface MrLink {repo:string;iid:string;url:string}
 export function mrLinksFromMessage(content:string,prefix:string):MrLink[]{
  const links=[...content.matchAll(urlPattern)].map(m=>({repo:m[1]!,iid:m[2]!,url:`https://codehub-y.huawei.com/${m[1]}/merge_requests/${m[2]}`}))
@@ -48,7 +49,7 @@ export function mrLinkFromMessage(content:string,prefix:string):{repo:string;iid
  const unique=new Map(matches.map(m=>[m.repo+':'+m.iid,m]));return unique.size===1?matches[0]:undefined;
 }
 export function manualMrLink(value:string):MrLink|undefined{
- const match=/^https:\/\/codehub-y\.huawei\.com\/([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+)\/merge_requests\/([1-9]\d*)\/?(?:[?#][^\s]*)?$/.exec(value);
+ const match=/^https:\/\/codehub-y\.huawei\.com\/([A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+)\/merge_requests\/([1-9]\d*)(?:\/diffs)?\/?(?:[?#][^\s]*)?$/.exec(value);
  if(!match||match[1]!.includes('..'))return;
  return {repo:match[1]!,iid:match[2]!,url:`https://codehub-y.huawei.com/${match[1]}/merge_requests/${match[2]}`};
 }

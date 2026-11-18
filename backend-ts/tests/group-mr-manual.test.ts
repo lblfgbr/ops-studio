@@ -53,10 +53,10 @@ test('manual-only configuration needs an authorized recipient but no group ID',a
 test('manual API returns accepted before Pi finishes, coalesces concurrent requests and preserves mandatory human review',async()=>{
  const h=harness(),app=Fastify();let release=()=>{};h.state.piBlock=new Promise<void>(resolve=>{release=resolve;});groupMrRoutes(app,h.service);
  try{
-  const response=await app.inject({method:'POST',url:'/api/automation/group-mr/submit',payload:{url:url+'/?tab=changes'}});
+  const response=await app.inject({method:'POST',url:'/api/automation/group-mr/submit',payload:{url:url+'/diffs/?tab=changes#note_123'}});
   assert.equal(response.statusCode,202);const body=response.json<{entryId:string;duplicate:boolean}>();assert.equal(body.duplicate,false);
   const duplicate=await h.service.submitManual({url});assert.deepEqual(duplicate,{entryId:body.entryId,duplicate:true});
-  assert.equal(h.service.list().length,1);const pending=h.service.list()[0]!;assert.equal(pending.source,'manual');assert.equal(pending.humanReviewRequired,true);assert.equal(pending.notificationReceiver,'owner123');
+  assert.equal(h.service.list().length,1);const pending=h.service.list()[0]!;assert.equal(pending.url,url);assert.equal(pending.source,'manual');assert.equal(pending.humanReviewRequired,true);assert.equal(pending.notificationReceiver,'owner123');
   release();await settle(h.service);const row=h.service.list()[0]!;
   assert.equal(h.state.piCalls,1);assert.equal(row.phase,'HUMAN');assert.equal(row.notification?.status,'sent');assert.equal(row.reply,undefined);
   assert.equal(h.sent.length,1);assert.equal(h.sent[0]?.receiver,'owner123');assert.match(h.sent[0]!.content,/手动 MR 检视完成/);assert.equal(h.calls.some(c=>c[2]==='merge'||c[0]==='welink-cli'),false);
